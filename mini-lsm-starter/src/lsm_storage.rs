@@ -24,6 +24,11 @@ use crate::table::SsTable;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
+type MemtablesOrdered<'a> = std::iter::Chain<
+    std::iter::Once<&'a std::sync::Arc<MemTable>>,
+    std::slice::Iter<'a, std::sync::Arc<MemTable>>,
+>;
+
 const TOMBSTONE: [u8; 0] = [];
 
 /// Represents the state of the storage engine.
@@ -65,6 +70,11 @@ impl LsmStorageState {
             levels,
             sstables: Default::default(),
         }
+    }
+
+    fn ordered_memtables(&self) -> MemtablesOrdered<'_> {
+        // Search from memtable firsts, and then others `imm_memtables`.
+        std::iter::once(&self.memtable).chain(&self.imm_memtables)
     }
 }
 
@@ -284,9 +294,8 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.read();
 
-        let value = std::iter::once(&state.memtable)
-            // Search from memtable firsts, and then others `imm_memtables`.
-            .chain(&state.imm_memtables)
+        let value = state
+            .ordered_memtables()
             // Stop as soon as we found the key.
             .filter_map(|memtable| memtable.get(key))
             .next()
@@ -378,8 +387,8 @@ impl LsmStorageInner {
     ) -> Result<FusedIterator<LsmIterator>> {
         let state = self.state.read();
 
-        let iters: Vec<Box<MemTableIterator>> = std::iter::once(&state.memtable)
-            .chain(&state.imm_memtables)
+        let iters: Vec<Box<MemTableIterator>> = state
+            .ordered_memtables()
             .map(|iter| Box::new(iter.scan(lower, upper)))
             .collect();
         let merge_iterator = MergeIterator::create(iters);
