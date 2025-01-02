@@ -99,6 +99,10 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     /// - Calling next on `self.current` to discard the smallest key.
     /// - Push back `self.current` into the heap and get the smallest iterator out.
     fn next(&mut self) -> Result<()> {
+        if !self.is_valid() {
+            return Ok(());
+        }
+
         let mut current = self
             .current
             .take()

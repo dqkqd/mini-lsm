@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::{bail, Result};
 
 use crate::{
@@ -15,8 +12,17 @@ pub struct LsmIterator {
     inner: LsmIteratorInner,
 }
 
+fn skip_deleted_keys_values(iter: &mut LsmIteratorInner) -> Result<()> {
+    // Skip deleted keys values
+    while iter.is_valid() && iter.value().is_empty() {
+        iter.next()?;
+    }
+    Ok(())
+}
+
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
+    pub(crate) fn new(mut iter: LsmIteratorInner) -> Result<Self> {
+        skip_deleted_keys_values(&mut iter)?;
         Ok(Self { inner: iter })
     }
 }
@@ -37,7 +43,9 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        self.inner.next()
+        self.inner.next()?;
+        skip_deleted_keys_values(&mut self.inner)?;
+        Ok(())
     }
 }
 
@@ -47,15 +55,12 @@ impl StorageIterator for LsmIterator {
 pub struct FusedIterator<I: StorageIterator> {
     iter: I,
     has_errored: bool,
-    valid: bool,
 }
 
 impl<I: StorageIterator> FusedIterator<I> {
     pub fn new(iter: I) -> Self {
-        let valid = iter.is_valid();
         Self {
             iter,
-            valid,
             has_errored: false,
         }
     }
