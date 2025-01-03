@@ -9,7 +9,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
@@ -223,7 +223,18 @@ impl SsTable {
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        match self.block_cache.as_ref() {
+            Some(block_cache) => {
+                let block = block_cache
+                    .try_get_with((self.sst_id(), block_idx), || self.read_block(block_idx));
+
+                match block {
+                    Ok(block) => Ok(block),
+                    Err(e) => bail!(format!("cannot get block: {}", e)),
+                }
+            }
+            None => self.read_block(block_idx),
+        }
     }
 
     /// Find the block that may contain `key`.
