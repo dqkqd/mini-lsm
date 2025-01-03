@@ -1,7 +1,4 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::key::{KeySlice, KeyVec};
 
@@ -34,44 +31,74 @@ impl BlockIterator {
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_first();
+        iter
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_key(key);
+        iter
     }
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        unimplemented!()
+        let (from, to) = self.value_range;
+        &self.block.data[from..to]
     }
 
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.key().is_empty()
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        unimplemented!()
+        self.seek_to_index(0);
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        unimplemented!()
+        self.seek_to_index(self.idx + 1);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        unimplemented!()
+        let position = self.block.offsets.binary_search_by(|offset| {
+            match self.block.key_at_offset(*offset) {
+                Some(key_pos) => key_pos.key.cmp(&key),
+                // If there are no key found at this position,
+                // then we have stepped outside block's data boundary,
+                // in such cases we can assume that it is always greater.
+                None => Ordering::Greater,
+            }
+        });
+
+        let idx = match position {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        self.seek_to_index(idx);
+    }
+
+    fn seek_to_index(&mut self, index: usize) {
+        let (key_pos, value_pos) = self.block.key_value_at_index(index).unwrap_or_default();
+
+        self.idx = index;
+        self.key = key_pos.key.to_key_vec();
+        if self.idx == 0 {
+            self.first_key = key_pos.key.to_key_vec();
+        }
+        self.value_range = value_pos.range;
     }
 }
