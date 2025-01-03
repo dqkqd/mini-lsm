@@ -77,6 +77,19 @@ impl BlockMeta {
             .collect()
     }
 
+    pub(crate) fn first_key(block_meta: &[BlockMeta]) -> KeyBytes {
+        block_meta
+            .first()
+            .map(|meta| meta.first_key.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn last_key(block_meta: &[BlockMeta]) -> KeyBytes {
+        block_meta
+            .last()
+            .map(|meta| meta.last_key.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// A file object.
@@ -139,7 +152,29 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let block_meta_offset = file.read(file.size() - 4, 4)?;
+        let block_meta_offset: [u8; 4] = block_meta_offset.try_into().unwrap();
+        let block_meta_offset = u32::from_le_bytes(block_meta_offset) as u64;
+
+        let block_meta_size = file.size() - 4 - block_meta_offset;
+        let block_meta = file.read(block_meta_offset, block_meta_size)?;
+        let block_meta = BlockMeta::decode_block_meta(Bytes::from(block_meta));
+        let first_key = BlockMeta::first_key(&block_meta);
+        let last_key = BlockMeta::last_key(&block_meta);
+
+        let sst = Self {
+            file,
+            block_meta,
+            block_meta_offset: block_meta_offset as usize,
+            id,
+            block_cache,
+            first_key,
+            last_key,
+            bloom: None,
+            max_ts: u64::MAX,
+        };
+
+        Ok(sst)
     }
 
     /// Create a mock SST with only first key + last key metadata
