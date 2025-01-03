@@ -199,7 +199,26 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        let block_meta_offset = self
+            .block_meta
+            .get(block_idx)
+            .map(|b| b.offset)
+            .with_context(|| "block idx out of range")?;
+
+        let next_block_meta_offset = self
+            .block_meta
+            .get(block_idx + 1)
+            .map(|b| b.offset)
+            .unwrap_or(self.block_meta_offset);
+
+        let block_data = self.file.read(
+            block_meta_offset as u64,
+            (next_block_meta_offset - block_meta_offset) as u64,
+        )?;
+
+        let block = Block::decode(&block_data);
+
+        Ok(Arc::new(block))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
@@ -211,7 +230,36 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        unimplemented!()
+        // Get the first index where `key >= table.block_meta.first_key`.
+        let idx = self
+            .block_meta
+            .binary_search_by(|meta| meta.first_key.as_key_slice().cmp(&key));
+
+        // Adjust the index again to make sure it does not fall into wrong block.
+        // For example, suppose we have 2 blocks like this:
+        // Searching for key 5 and key 2 both pointing into block-1.
+        //          block-0    block-1
+        //          [1, 4]     [6, 8]
+        // case 1:          5
+        // case 2:    2
+        //
+        // In the first case, it is correct that the index pointing to block-1.
+        // In the second case, it should point into block-0 instead.
+        match idx {
+            // The key equal first, no need to check here.
+            Ok(idx) => idx,
+
+            // The key might not exist.
+            Err(mut idx) => {
+                if let Some(prev_idx) = idx.checked_sub(1) {
+                    let block_meta = &self.block_meta[prev_idx];
+                    if block_meta.last_key.as_key_slice() >= key {
+                        idx = prev_idx;
+                    }
+                }
+                idx
+            }
+        }
     }
 
     /// Get number of data blocks.
