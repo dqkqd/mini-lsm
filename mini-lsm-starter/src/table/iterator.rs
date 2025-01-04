@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops::Bound, sync::Arc};
 
 use anyhow::Result;
 
@@ -66,6 +66,33 @@ impl SsTableIterator {
         self.blk_idx = blk_idx;
 
         Ok(())
+    }
+
+    pub(crate) fn crate_and_seek_to_lower_bound(
+        table: Arc<SsTable>,
+        bound: Bound<&[u8]>,
+    ) -> Result<Self> {
+        match bound {
+            Bound::Included(b) | Bound::Excluded(b) => {
+                let key = KeySlice::from_slice(b);
+                let blk_idx = table.find_block_idx(key);
+                let block = table.read_block_cached(blk_idx)?;
+                let blk_iter = BlockIterator::create_and_seek_to_key(block, key);
+
+                let mut iter = SsTableIterator {
+                    table,
+                    blk_iter,
+                    blk_idx,
+                };
+
+                if matches!(bound, Bound::Excluded(_)) && iter.is_valid() && iter.key() == key {
+                    iter.next()?;
+                }
+
+                Ok(iter)
+            }
+            Bound::Unbounded => Self::create_and_seek_to_first(table),
+        }
     }
 
     /// Seek to the first key at block index.
