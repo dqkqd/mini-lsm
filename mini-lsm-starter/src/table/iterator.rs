@@ -1,6 +1,6 @@
 use std::{ops::Bound, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use super::SsTable;
 use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
@@ -68,31 +68,72 @@ impl SsTableIterator {
         Ok(())
     }
 
-    pub(crate) fn crate_and_seek_to_lower_bound(
+    pub(crate) fn create_with_bound(
         table: Arc<SsTable>,
-        bound: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<Self> {
-        match bound {
-            Bound::Included(b) | Bound::Excluded(b) => {
-                let key = KeySlice::from_slice(b);
-                let blk_idx = table.find_block_idx(key);
-                let block = table.read_block_cached(blk_idx)?;
-                let blk_iter = BlockIterator::create_and_seek_to_key(block, key);
+        let first_key = table.first_key.clone();
+        let first_key = first_key.as_key_slice();
 
-                let mut iter = SsTableIterator {
-                    table,
-                    blk_iter,
-                    blk_idx,
-                };
+        let last_key = table.last_key.clone();
+        let last_key = last_key.as_key_slice();
 
-                if matches!(bound, Bound::Excluded(_)) && iter.is_valid() && iter.key() == key {
-                    iter.next()?;
-                }
+        // Adjust lower bound with the first key.
+        let lower = lower.map(KeySlice::from_slice);
+        let lower = match lower {
+            Bound::Unbounded => Bound::Included(first_key),
+            Bound::Included(key) => Bound::Included(key.max(first_key)),
+            Bound::Excluded(key) if key < first_key => Bound::Included(first_key),
+            b => b,
+        };
 
-                Ok(iter)
-            }
-            Bound::Unbounded => Self::create_and_seek_to_first(table),
+        // Adjust upper bound with the last key.
+        let upper = upper.map(KeySlice::from_slice);
+        let upper = match upper {
+            Bound::Unbounded => Bound::Included(last_key),
+            Bound::Included(key) => Bound::Included(key.min(last_key)),
+            Bound::Excluded(key) if key > first_key => Bound::Included(last_key),
+            b => b,
+        };
+
+        let lower_key = match lower {
+            Bound::Included(key) | Bound::Excluded(key) => key,
+            Bound::Unbounded => unreachable!("unbounded has been filtered out already"),
+        };
+        let upper_key = match upper {
+            Bound::Included(key) | Bound::Excluded(key) => key,
+            Bound::Unbounded => unreachable!("unbounded has been filtered out already"),
+        };
+        if lower_key > upper_key {
+            bail!("lower bound greater than than upper bound");
         }
+        if lower_key == upper_key
+            && !matches!((lower, upper), (Bound::Included(_), Bound::Included(_)))
+        {
+            bail!("lower bound equals upper bound but one of the bound is not `Bound::Included`");
+        }
+
+        let mut iter = Self::create_and_seek_to_key(table, lower_key)?;
+
+        // Exclude lower key.
+        if matches!(lower, Bound::Excluded(_)) && iter.is_valid() && iter.key() == lower_key {
+            iter.next()?;
+        }
+        // This iterator might be invalid after calling `next`.
+        if !iter.is_valid() {
+            bail!("invalid iterator");
+        }
+
+        // invalidate this iterator if it exceeds upper boundary.
+        if matches!(upper, Bound::Excluded(_)) && iter.is_valid() && iter.key() >= upper_key {
+            bail!("invalid range");
+        }
+        if matches!(upper, Bound::Included(_)) && iter.is_valid() && iter.key() > upper_key {
+            bail!("invalid range");
+        }
+
+        Ok(iter)
     }
 
     /// Seek to the first key at block index.

@@ -447,7 +447,7 @@ impl LsmStorageInner {
             .l0_sstables
             .iter()
             .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
-            .filter_map(|table| SsTableIterator::crate_and_seek_to_lower_bound(table, lower).ok())
+            .filter_map(|table| SsTableIterator::create_with_bound(table, lower, upper).ok())
             .map(Box::new)
             .collect();
 
