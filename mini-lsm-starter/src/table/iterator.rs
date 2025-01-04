@@ -1,6 +1,9 @@
-use std::{ops::Bound, sync::Arc};
+use std::{
+    ops::{Bound, Range},
+    sync::Arc,
+};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use super::SsTable;
 use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
@@ -73,64 +76,39 @@ impl SsTableIterator {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<Self> {
+        // Range from table.
         let first_key = table.first_key.clone();
         let first_key = first_key.as_key_slice();
-
         let last_key = table.last_key.clone();
         let last_key = last_key.as_key_slice();
-
-        // Adjust lower bound with the first key.
-        let lower = lower.map(KeySlice::from_slice);
-        let lower = match lower {
-            Bound::Unbounded => Bound::Included(first_key),
-            Bound::Included(key) => Bound::Included(key.max(first_key)),
-            Bound::Excluded(key) if key < first_key => Bound::Included(first_key),
-            b => b,
+        let table_range = Range {
+            start: Bound::Included(first_key),
+            end: Bound::Included(last_key),
         };
 
-        // Adjust upper bound with the last key.
-        let upper = upper.map(KeySlice::from_slice);
-        let upper = match upper {
-            Bound::Unbounded => Bound::Included(last_key),
-            Bound::Included(key) => Bound::Included(key.min(last_key)),
-            Bound::Excluded(key) if key > first_key => Bound::Included(last_key),
-            b => b,
+        // Provided range.
+        let range = Range {
+            start: lower.map(KeySlice::from_slice),
+            end: upper.map(KeySlice::from_slice),
         };
+        let range = range_overlap(range, table_range)
+            .with_context(|| "provided range does not overlap with table")?;
 
-        let lower_key = match lower {
+        let lower_key = match range.start {
             Bound::Included(key) | Bound::Excluded(key) => key,
-            Bound::Unbounded => unreachable!("unbounded has been filtered out already"),
+            Bound::Unbounded => unreachable!("table range should not be unbounded"),
         };
-        let upper_key = match upper {
-            Bound::Included(key) | Bound::Excluded(key) => key,
-            Bound::Unbounded => unreachable!("unbounded has been filtered out already"),
-        };
-        if lower_key > upper_key {
-            bail!("lower bound greater than than upper bound");
-        }
-        if lower_key == upper_key
-            && !matches!((lower, upper), (Bound::Included(_), Bound::Included(_)))
-        {
-            bail!("lower bound equals upper bound but one of the bound is not `Bound::Included`");
-        }
-
         let mut iter = Self::create_and_seek_to_key(table, lower_key)?;
 
-        // Exclude lower key.
-        if matches!(lower, Bound::Excluded(_)) && iter.is_valid() && iter.key() == lower_key {
+        // Key not in range, this could be because the range has excluded lower bound.
+        if iter.is_valid() && !range_contains(&range, iter.key()) {
             iter.next()?;
         }
-        // This iterator might be invalid after calling `next`.
-        if !iter.is_valid() {
-            bail!("invalid iterator");
-        }
 
-        // invalidate this iterator if it exceeds upper boundary.
-        if matches!(upper, Bound::Excluded(_)) && iter.is_valid() && iter.key() >= upper_key {
-            bail!("invalid range");
-        }
-        if matches!(upper, Bound::Included(_)) && iter.is_valid() && iter.key() > upper_key {
-            bail!("invalid range");
+        // Check again if the iterator is invalid,
+        // Or the key still is not in scan range after calling `next`.
+        if !iter.is_valid() || !range_contains(&range, iter.key()) {
+            bail!("cannot find correct iter for provided range");
         }
 
         Ok(iter)
@@ -174,5 +152,78 @@ impl StorageIterator for SsTableIterator {
         }
 
         Ok(())
+    }
+}
+
+fn range_contains(range: &Range<Bound<KeySlice>>, key: KeySlice) -> bool {
+    match range.start {
+        Bound::Included(k) if key < k => return false,
+        Bound::Excluded(k) if key <= k => return false,
+        _ => {}
+    }
+    match range.end {
+        Bound::Included(k) if key > k => return false,
+        Bound::Excluded(k) if key >= k => return false,
+        _ => {}
+    }
+    true
+}
+
+fn range_overlap<'a>(
+    lhs: Range<Bound<KeySlice<'a>>>,
+    rhs: Range<Bound<KeySlice<'a>>>,
+) -> Option<Range<Bound<KeySlice<'a>>>> {
+    let lhs = lhs.clone();
+
+    let start = match (lhs.start, rhs.start) {
+        (Bound::Unbounded, rhs) => rhs,
+        (lhs, Bound::Unbounded) => lhs,
+        (Bound::Included(lhs), Bound::Included(rhs)) => Bound::Included(lhs.max(rhs)),
+        (Bound::Excluded(lhs), Bound::Excluded(rhs)) => Bound::Excluded(lhs.max(rhs)),
+        (Bound::Included(lhs), Bound::Excluded(rhs)) => {
+            if lhs > rhs {
+                Bound::Included(lhs)
+            } else {
+                Bound::Excluded(rhs)
+            }
+        }
+        (Bound::Excluded(lhs), Bound::Included(rhs)) => {
+            if lhs > rhs {
+                Bound::Excluded(lhs)
+            } else {
+                Bound::Included(rhs)
+            }
+        }
+    };
+
+    let end = match (lhs.end, rhs.end) {
+        (Bound::Unbounded, rhs) => rhs,
+        (lhs, Bound::Unbounded) => lhs,
+        (Bound::Included(lhs), Bound::Included(rhs)) => Bound::Included(lhs.min(rhs)),
+        (Bound::Excluded(lhs), Bound::Excluded(rhs)) => Bound::Excluded(lhs.min(rhs)),
+        (Bound::Included(lhs), Bound::Excluded(rhs)) => {
+            if lhs < rhs {
+                Bound::Included(lhs)
+            } else {
+                Bound::Excluded(rhs)
+            }
+        }
+        (Bound::Excluded(lhs), Bound::Included(rhs)) => {
+            if lhs < rhs {
+                Bound::Excluded(lhs)
+            } else {
+                Bound::Included(rhs)
+            }
+        }
+    };
+
+    match (start, end) {
+        (Bound::Unbounded, _) => Some(Range { start, end }),
+        (_, Bound::Unbounded) => Some(Range { start, end }),
+        (Bound::Included(l), Bound::Included(r)) if l <= r => Some(Range { start, end }),
+        (Bound::Included(l), Bound::Excluded(r)) if l < r => Some(Range { start, end }),
+        (Bound::Excluded(l), Bound::Included(r)) if l < r => Some(Range { start, end }),
+        (Bound::Excluded(l), Bound::Excluded(r)) if l < r => Some(Range { start, end }),
+        _ => None,
     }
 }
