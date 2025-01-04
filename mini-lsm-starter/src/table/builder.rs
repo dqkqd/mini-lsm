@@ -4,12 +4,18 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use super::{BlockMeta, SsTable};
-use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache, table::FileObject};
+use crate::{
+    block::BlockBuilder,
+    key::KeySlice,
+    lsm_storage::BlockCache,
+    table::{bloom::Bloom, FileObject},
+};
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
     data: Vec<u8>,
+    key_hashes: Vec<u32>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
 }
@@ -21,6 +27,7 @@ impl SsTableBuilder {
         Self {
             builder,
             data: Vec::new(),
+            key_hashes: Vec::new(),
             meta: Vec::new(),
             block_size,
         }
@@ -68,6 +75,15 @@ impl SsTableBuilder {
             last_key,
         });
 
+        self.key_hashes.extend(
+            // Add all key hashes from block to `self.key_hashes` for bloom filter
+            block
+                .offsets
+                .iter()
+                .filter_map(|offset| block.key_at_offset(*offset))
+                .map(|position| farmhash::fingerprint32(position.key.raw_ref())),
+        );
+
         self.data.extend_from_slice(block.encode().as_ref());
     }
 
@@ -80,6 +96,10 @@ impl SsTableBuilder {
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
+    ///
+    /// The layout is saved like this:
+    /// | data block | data block | .... | meta block | bloom filter | meta block offset | bloom filter offset |
+    ///
     pub fn build(
         mut self,
         id: usize,
@@ -92,17 +112,33 @@ impl SsTableBuilder {
         let first_key = BlockMeta::first_key(&self.meta);
         let last_key = BlockMeta::last_key(&self.meta);
 
-        let block_meta_offset = self.data.len();
+        // data block
+        let mut data = self.data;
+
+        // Save block meta offset before writing block meta
+        let block_meta_offset = data.len();
         if block_meta_offset > u32::MAX as usize {
             bail!("block meta offset too large");
         }
 
-        // data block
-        let mut data = self.data;
         // block meta
         BlockMeta::encode_block_meta(&self.meta, &mut data);
+
+        // Save bloom filter offset before writing bloom filter
+        let bloom_filter_offset = data.len();
+        if bloom_filter_offset > u32::MAX as usize {
+            bail!("bloom filter offset too large");
+        }
+
+        // bloom filter
+        let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
+        let bloom = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
+        bloom.encode(&mut data);
+
         // block meta offset
         data.extend_from_slice(&(block_meta_offset as u32).to_le_bytes());
+        // bloom filter offset
+        data.extend_from_slice(&(bloom_filter_offset as u32).to_le_bytes());
 
         // save to file
         let file = FileObject::create(path.as_ref(), data)?;
@@ -115,7 +151,8 @@ impl SsTableBuilder {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            // TODO:
+            bloom: Some(bloom),
             max_ts: u64::MAX,
         };
 

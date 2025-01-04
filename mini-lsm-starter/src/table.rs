@@ -151,13 +151,29 @@ impl SsTable {
     }
 
     /// Open SSTable from a file.
+    ///
+    /// The layout was saved like this:
+    /// | data block | data block | .... | meta block | bloom filter | meta block offset | bloom filter offset |
+    ///
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        let block_meta_offset = file.read(file.size() - 4, 4)?;
-        let block_meta_offset: [u8; 4] = block_meta_offset.try_into().unwrap();
+        // offsets
+        let offset = file.read(file.size() - 8, 8)?;
+        let block_meta_offset: [u8; 4] = offset[..4].try_into().unwrap();
         let block_meta_offset = u32::from_le_bytes(block_meta_offset) as u64;
+        let bloom_filter_offset: [u8; 4] = offset[4..].try_into().unwrap();
+        let bloom_filter_offset = u32::from_le_bytes(bloom_filter_offset) as u64;
 
-        let block_meta_size = file.size() - 4 - block_meta_offset;
-        let block_meta = file.read(block_meta_offset, block_meta_size)?;
+        // Calculate size based on offsets.
+        let block_meta_size = bloom_filter_offset - block_meta_offset;
+        let bloom_filter_size = file.size() - 8 - bloom_filter_offset;
+
+        // Read the whole block meta and bloom (instead of reading separately), to avoid disk seek.
+        let mut meta = file.read(block_meta_offset, block_meta_size + bloom_filter_size)?;
+        let bloom = meta.split_off(block_meta_size as usize);
+        let block_meta = meta;
+
+        let bloom = Bloom::decode(&bloom)?;
+
         let block_meta = BlockMeta::decode_block_meta(Bytes::from(block_meta));
         let first_key = BlockMeta::first_key(&block_meta);
         let last_key = BlockMeta::last_key(&block_meta);
@@ -170,7 +186,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: u64::MAX,
         };
 
