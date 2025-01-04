@@ -1,6 +1,7 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
+use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -15,15 +16,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
-use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::merge_iterator::{self, MergeIterator};
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::{MemTable, MemTableIterator};
+use crate::mem_table::{self, MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -253,6 +254,8 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        // Do not check for error, in case the folder is already created.
+        let _ = fs::create_dir_all(path);
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -395,7 +398,27 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        let mem_table = self.state.read().imm_memtables.last().cloned();
+        if let Some(mem_table) = mem_table {
+            let mut builder = SsTableBuilder::new(self.options.block_size);
+            mem_table.flush(&mut builder)?;
+            let sst_id = mem_table.id();
+            let path = self.path_of_sst(sst_id);
+            let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+
+            let mut state = self.state.write();
+
+            let mut new_state = state.as_ref().clone();
+            new_state.imm_memtables.pop();
+            new_state.l0_sstables.insert(0, sst_id);
+            new_state.sstables.insert(sst_id, Arc::new(sstable));
+
+            *state = Arc::new(new_state);
+        }
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
