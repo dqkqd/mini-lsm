@@ -318,7 +318,14 @@ impl LsmStorageInner {
                 .l0_sstables
                 .iter()
                 .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
-                .filter_map(|table| SsTableIterator::create_and_seek_to_key(table, key).ok())
+                .filter_map(|table| {
+                    SsTableIterator::create_with_bound(
+                        table,
+                        Bound::Included(key.raw_ref()),
+                        Bound::Included(key.raw_ref()),
+                    )
+                    .ok()
+                })
                 .map(Box::new)
                 .collect();
             let merge_iterator = MergeIterator::create(sstable_iters);
