@@ -1,5 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -79,7 +81,13 @@ impl Bloom {
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
 
-        // TODO: build the bloom filter
+        for key in keys {
+            let mut hashed = *key as u64;
+            for _ in 0..k {
+                hashed = calculate_hash(&hashed) % (nbits as u64);
+                filter.set_bit(hashed as usize, true);
+            }
+        }
 
         Self {
             filter: filter.freeze(),
@@ -94,11 +102,22 @@ impl Bloom {
             true
         } else {
             let nbits = self.filter.bit_len();
-            let delta = h.rotate_left(15);
 
-            // TODO: probe the bloom filter
+            let mut hashed = h as u64;
+            for _ in 0..self.k {
+                hashed = calculate_hash(&hashed) % (nbits as u64);
+                if !self.filter.get_bit(hashed as usize) {
+                    return false;
+                }
+            }
 
             true
         }
     }
+}
+
+fn calculate_hash<T: Hash>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
 }
