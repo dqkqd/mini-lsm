@@ -314,10 +314,19 @@ impl LsmStorageInner {
         // Cannot find value in memory, let try to find it in sstables.
         if value.is_none() {
             let key = KeySlice::from_slice(key);
+            let keyhash = farmhash::fingerprint32(key.raw_ref());
             let sstable_iters: Vec<Box<SsTableIterator>> = snapshot
                 .l0_sstables
                 .iter()
                 .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
+                // Use bloom filter.
+                .filter(|sstable| {
+                    sstable
+                        .bloom
+                        .as_ref()
+                        .is_some_and(|bloom| bloom.may_contain(keyhash))
+                })
+                // Use range [key,key] to in table.
                 .filter_map(|table| {
                     SsTableIterator::create_with_bound(
                         table,
