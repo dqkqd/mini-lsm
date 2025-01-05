@@ -1,7 +1,4 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
-use std::sync::Arc;
+use std::{ops::Bound, sync::Arc};
 
 use anyhow::Result;
 
@@ -21,11 +18,45 @@ pub struct SstConcatIterator {
 
 impl SstConcatIterator {
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
-        unimplemented!()
+        if let Some(table) = sstables.first() {
+            if let Ok(iter) = SsTableIterator::create_and_seek_to_first(table.clone()) {
+                if iter.is_valid() {
+                    return Ok(Self {
+                        current: Some(iter),
+                        next_sst_idx: 1,
+                        sstables,
+                    });
+                }
+            }
+        }
+
+        // Cannot find iterator.
+        Ok(Self {
+            current: None,
+            next_sst_idx: sstables.len(),
+            sstables,
+        })
     }
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
-        unimplemented!()
+        for (sst_idx, table) in sstables.iter().enumerate() {
+            if let Ok(iter) = SsTableIterator::create_and_seek_to_key(table.clone(), key) {
+                if iter.is_valid() {
+                    return Ok(Self {
+                        current: Some(iter),
+                        next_sst_idx: sst_idx + 1,
+                        sstables,
+                    });
+                }
+            }
+        }
+
+        // Cannot find iterator.
+        Ok(Self {
+            current: None,
+            next_sst_idx: sstables.len(),
+            sstables,
+        })
     }
 }
 
@@ -33,22 +64,44 @@ impl StorageIterator for SstConcatIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map(|current| current.key())
+            .unwrap_or_default()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map(|current| current.value())
+            .unwrap_or_default()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.is_some() && self.next_sst_idx <= self.sstables.len()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if let Some(iter) = self.current.as_mut() {
+            iter.next()?;
+
+            // Seek to the next iterator if the current one is invalid.
+            if !iter.is_valid() {
+                if let Some(table) = self.sstables.get(self.next_sst_idx) {
+                    *iter = SsTableIterator::create_and_seek_to_first(table.clone())?
+                };
+                self.next_sst_idx += 1;
+            }
+        }
+
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {
-        1
+        if self.current.is_some() {
+            1
+        } else {
+            0
+        }
     }
 }
