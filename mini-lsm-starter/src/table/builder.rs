@@ -92,6 +92,13 @@ impl SsTableBuilder {
 
         self.data.extend_from_slice(block.encode().as_ref());
     }
+    /// Whether the SSTable is empty.
+    ///
+    /// A SSTable is empty if and only if it has no data, and there is no incoming data in the
+    /// underlying [`BlockBuilder`].
+    pub fn is_empty(&self) -> bool {
+        self.estimated_size() == 0 && self.builder.is_empty()
+    }
 
     /// Get the estimated size of the SSTable.
     ///
