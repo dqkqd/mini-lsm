@@ -38,8 +38,16 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
-        if !self.builder.add(key, value) {
+        // Can add key, just return
+        if self.builder.add(key, value) {
+            return;
+        }
+
+        // Cannot add data and `self.builder` is not empty,
+        // then it should be full, need to split out and try again.
+        if !self.builder.is_empty() {
             self.split();
+
             if !self.builder.add(key, value) {
                 panic!("cannot add new key after splitting builder");
             }
@@ -104,8 +112,10 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        // split current block to get the latest data.
-        self.split();
+        // split current block builder to get the latest data.
+        if !self.builder.is_empty() {
+            self.split();
+        }
 
         let first_key = BlockMeta::first_key(&self.meta);
         let last_key = BlockMeta::last_key(&self.meta);
