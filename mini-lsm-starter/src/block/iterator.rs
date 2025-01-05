@@ -76,7 +76,7 @@ impl BlockIterator {
     pub fn seek_to_key(&mut self, key: KeySlice) {
         let position = self.block.offsets.binary_search_by(|offset| {
             match self.block.key_at_offset(*offset) {
-                Some(key_pos) => key_pos.key.cmp(&key),
+                Some(key_pos) => key_pos.key.as_key_slice().cmp(&key),
                 // If there are no key found at this position,
                 // then we have stepped outside block's data boundary,
                 // in such cases we can assume that it is always greater.
@@ -93,12 +93,11 @@ impl BlockIterator {
 
     fn seek_to_index(&mut self, index: usize) {
         let (key_pos, value_pos) = self.block.key_value_at_index(index).unwrap_or_default();
-
-        self.idx = index;
-        self.key = key_pos.key.to_key_vec();
-        if self.idx == 0 {
-            self.first_key = key_pos.key.to_key_vec();
+        if index == 0 {
+            self.first_key = key_pos.key.clone();
         }
+        self.idx = index;
+        self.key = key_pos.key;
         self.value_range = value_pos.range;
     }
 }

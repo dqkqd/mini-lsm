@@ -5,17 +5,27 @@ pub use builder::BlockBuilder;
 use bytes::Bytes;
 pub use iterator::BlockIterator;
 
-use crate::key::KeySlice;
+use crate::key::KeyVec;
 
 #[derive(Default)]
-pub(crate) struct BlockKeyPosition<'a> {
-    pub key: KeySlice<'a>,
+pub(crate) struct BlockKey {
+    pub key: KeyVec,
     pub range: (usize, usize),
 }
 
 #[derive(Default)]
-pub(crate) struct BlockValuePosition {
-    pub range: (usize, usize),
+pub(crate) struct BlockData<'a> {
+    data: &'a [u8],
+    range: (usize, usize),
+}
+
+impl From<BlockData<'_>> for BlockKey {
+    fn from(block_data: BlockData<'_>) -> Self {
+        Self {
+            key: KeyVec::from_vec(block_data.data.to_vec()),
+            range: block_data.range,
+        }
+    }
 }
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
@@ -23,6 +33,7 @@ pub(crate) struct BlockValuePosition {
 pub struct Block {
     pub(crate) data: Vec<u8>,
     pub(crate) offsets: Vec<u16>,
+    pub(crate) first_key: Option<KeyVec>,
 }
 
 impl Block {
@@ -44,66 +55,89 @@ impl Block {
     }
 
     fn decode_checked(data: &[u8]) -> Option<Self> {
-        let (data, num_elements) = data.split_last_chunk::<2>()?;
+        let num_elements = u16_at(data, (data.len() - 2) as u16)?;
 
-        let num_elements = u16::from_le_bytes(*num_elements);
+        let data = &data[..data.len() - 2];
         let offset_start = data.len().checked_sub(num_elements as usize * 2)?;
-
         let (data, offsets) = data.split_at_checked(offset_start)?;
 
         let offsets: Vec<u16> = offsets
             .chunks(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .filter_map(|chunk| u16_at(chunk, 0))
             .collect();
 
-        Some(Self {
+        let first_key = data_at(data, 0)
+            .map(BlockKey::from)
+            .map(|block_key| block_key.key);
+
+        let block = Self {
             data: Vec::from(data),
             offsets,
-        })
+            first_key,
+        };
+
+        Some(block)
     }
 
     /// Return a pair (key, value) position at specific index.
-    pub(crate) fn key_value_at_index(
-        &self,
-        index: usize,
-    ) -> Option<(BlockKeyPosition, BlockValuePosition)> {
-        let key = self.key_at_index(index)?;
-        let value = self.value_at_offset(key.range.1 as u16)?;
+    pub(crate) fn key_value_at_index(&self, index: usize) -> Option<(BlockKey, BlockData)> {
+        let offset = self.offsets.get(index)?;
+        let key = self.key_at_offset(*offset)?;
+        let value = self.data_at_offset(key.range.1 as u16)?;
         Some((key, value))
     }
 
-    // Return a key position at specific index.
-    pub(crate) fn key_at_index(&self, index: usize) -> Option<BlockKeyPosition> {
-        let offset = self.offsets.get(index)?;
-        self.key_at_offset(*offset)
-    }
-
     // Return a key position at specific offset.
-    pub(crate) fn key_at_offset(&self, offset: u16) -> Option<BlockKeyPosition> {
-        let offset = offset as usize;
+    pub(crate) fn key_at_offset(&self, offset: u16) -> Option<BlockKey> {
+        if offset == 0 {
+            // The first key is saved same as normal data.
+            self.data_at_offset(offset).map(BlockKey::from)
+        } else {
+            // Other keys is saved using prefixed encoding
+            // | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len)
+            let key_overlap_len = self.sizehint_at_offset(offset)?;
+            let rest_key = self.data_at_offset(offset + 2)?;
 
-        let data = self.data[offset..].as_ref();
-        let (key_len, key) = data.split_first_chunk::<2>()?;
-        let key_len = u16::from_le_bytes(*key_len) as usize;
-        let (key, _) = key.split_at_checked(key_len)?;
+            let first_key = self.first_key.as_ref()?;
 
-        Some(BlockKeyPosition {
-            key: KeySlice::from_slice(key),
-            range: (offset + 2, offset + 2 + key_len),
-        })
+            let key = [
+                &first_key.raw_ref()[..key_overlap_len as usize],
+                rest_key.data,
+            ]
+            .concat();
+
+            Some(BlockKey {
+                key: KeyVec::from_vec(key),
+                range: rest_key.range,
+            })
+        }
     }
 
-    // Return a value position at specific offset.
-    fn value_at_offset(&self, offset: u16) -> Option<BlockValuePosition> {
-        let offset = offset as usize;
-
-        let data = self.data[offset..].as_ref();
-        let (value_len, value) = data.split_first_chunk::<2>()?;
-        let value_len = u16::from_le_bytes(*value_len) as usize;
-        let _ = value.split_at_checked(value_len)?;
-
-        Some(BlockValuePosition {
-            range: (offset + 2, offset + 2 + value_len),
-        })
+    /// Get variable length data at offset.
+    /// | data len (u16) | data |
+    fn data_at_offset(&self, offset: u16) -> Option<BlockData> {
+        data_at(&self.data, offset)
     }
+
+    // Get 2 bytes length (u16) at offset.
+    fn sizehint_at_offset(&self, offset: u16) -> Option<u16> {
+        u16_at(&self.data, offset)
+    }
+}
+
+fn u16_at(data: &[u8], at: u16) -> Option<u16> {
+    let offset = at as usize;
+    let data = &data[offset..];
+    let (data_len, _) = data.split_first_chunk::<2>()?;
+    Some(u16::from_le_bytes(*data_len))
+}
+
+fn data_at(data: &[u8], at: u16) -> Option<BlockData> {
+    let data_len = u16_at(data, at)?;
+    let from = (at + 2) as usize;
+    let to = (at + 2 + data_len) as usize;
+    Some(BlockData {
+        data: &data[from..to],
+        range: (from, to),
+    })
 }

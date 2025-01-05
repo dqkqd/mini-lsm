@@ -53,27 +53,11 @@ impl SsTableBuilder {
 
         let block = builder.build();
 
-        let offset = self.data.len();
-        let first_key = block
-            .key_at_index(0)
-            .unwrap_or_default()
-            .key
-            .to_key_vec()
-            .into_key_bytes();
-        let last_key = block
-            .offsets
-            .last()
-            .and_then(|offset| block.key_at_offset(*offset))
-            .unwrap_or_default()
-            .key
-            .to_key_vec()
-            .into_key_bytes();
-
-        self.meta.push(BlockMeta {
-            offset,
-            first_key,
-            last_key,
-        });
+        let first_key = match &block.first_key {
+            Some(first_key) => first_key.clone().into_key_bytes(),
+            // This block is empty, do not split, just return.
+            None => return,
+        };
 
         self.key_hashes.extend(
             // Add all key hashes from block to `self.key_hashes` for bloom filter
@@ -83,6 +67,20 @@ impl SsTableBuilder {
                 .filter_map(|offset| block.key_at_offset(*offset))
                 .map(|position| farmhash::fingerprint32(position.key.raw_ref())),
         );
+
+        let offset = self.data.len();
+        let last_key = block
+            .offsets
+            .last()
+            .and_then(|offset| block.key_at_offset(*offset))
+            .unwrap_or_default()
+            .key
+            .into_key_bytes();
+        self.meta.push(BlockMeta {
+            offset,
+            first_key,
+            last_key,
+        });
 
         self.data.extend_from_slice(block.encode().as_ref());
     }
@@ -151,7 +149,6 @@ impl SsTableBuilder {
             block_cache,
             first_key,
             last_key,
-            // TODO:
             bloom: Some(bloom),
             max_ts: u64::MAX,
         };
