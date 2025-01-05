@@ -16,6 +16,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
@@ -310,36 +311,58 @@ impl LsmStorageInner {
             // Stop as soon as we found the key.
             .filter_map(|memtable| memtable.get(key))
             .next();
+        if value.is_some() {
+            value = value.filter(|value| !value.is_empty());
+            return Ok(value);
+        }
 
-        // Cannot find value in memory, let try to find it in sstables.
-        if value.is_none() {
-            let key = KeySlice::from_slice(key);
-            let keyhash = farmhash::fingerprint32(key.raw_ref());
-            let sstable_iters: Vec<Box<SsTableIterator>> = snapshot
+        // Find value in disk.
+        let key = KeySlice::from_slice(key);
+        let keyhash = farmhash::fingerprint32(key.raw_ref());
+        let lower = Bound::Included(key.raw_ref());
+        let upper = Bound::Included(key.raw_ref());
+
+        // Find from l0 tables.
+        {
+            let l0_iters: Vec<Box<SsTableIterator>> = snapshot
                 .l0_sstables
                 .iter()
                 .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
                 // Use bloom filter.
-                .filter(|sstable| {
-                    sstable
+                .filter(|table| {
+                    table
                         .bloom
                         .as_ref()
                         .is_some_and(|bloom| bloom.may_contain(keyhash))
                 })
-                // Use range [key,key] to in table.
-                .filter_map(|table| {
-                    SsTableIterator::create_with_bound(
-                        table,
-                        Bound::Included(key.raw_ref()),
-                        Bound::Included(key.raw_ref()),
-                    )
-                    .ok()
-                })
+                // Use range [key,key] to find in table.
+                .filter_map(|table| SsTableIterator::create_with_bound(table, lower, upper).ok())
                 .map(Box::new)
                 .collect();
-            let merge_iterator = MergeIterator::create(sstable_iters);
-            if merge_iterator.is_valid() && merge_iterator.key() == key {
-                value = Some(Bytes::copy_from_slice(merge_iterator.value()))
+            let iter = MergeIterator::create(l0_iters);
+            if iter.is_valid() && iter.key() == key {
+                value = Some(Bytes::copy_from_slice(iter.value()))
+            }
+        }
+
+        // Find from l1 tables
+        if value.is_none() {
+            let sstables: Vec<Arc<SsTable>> = snapshot
+                .levels
+                .iter()
+                .flat_map(|(_, sst_ids)| sst_ids.iter())
+                .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
+                // Use bloom filter.
+                .filter(|table| {
+                    table
+                        .bloom
+                        .as_ref()
+                        .is_some_and(|bloom| bloom.may_contain(keyhash))
+                })
+                .collect();
+            let iter = SstConcatIterator::create_with_bound(sstables, upper, lower)?;
+            if iter.is_valid() && iter.key() == key {
+                value = Some(Bytes::copy_from_slice(iter.value()))
             }
         }
 
@@ -456,10 +479,11 @@ impl LsmStorageInner {
 
         let memtable_iters: Vec<Box<MemTableIterator>> = snapshot
             .ordered_memtables()
-            .map(|iter| Box::new(iter.scan(lower, upper)))
+            .map(|iter| iter.scan(lower, upper))
+            .map(Box::new)
             .collect();
 
-        let sstable_iters: Vec<Box<SsTableIterator>> = snapshot
+        let l0_iters: Vec<Box<SsTableIterator>> = snapshot
             .l0_sstables
             .iter()
             .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
@@ -467,12 +491,21 @@ impl LsmStorageInner {
             .map(Box::new)
             .collect();
 
-        let two_merge_iters = TwoMergeIterator::create(
+        let memtable_and_l0_iters = TwoMergeIterator::create(
             MergeIterator::create(memtable_iters),
-            MergeIterator::create(sstable_iters),
+            MergeIterator::create(l0_iters),
         )?;
 
-        let lsm_iterator = LsmIterator::new(two_merge_iters, lower, upper)?;
+        let l1_sstables: Vec<Arc<SsTable>> = snapshot
+            .levels
+            .iter()
+            .flat_map(|(_, sst_ids)| sst_ids.iter())
+            .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
+            .collect();
+        let l1_iters = SstConcatIterator::create_with_bound(l1_sstables, lower, upper)?;
+
+        let iters = TwoMergeIterator::create(memtable_and_l0_iters, l1_iters)?;
+        let lsm_iterator = LsmIterator::new(iters, lower, upper)?;
         let fused_iterator = FusedIterator::new(lsm_iterator);
 
         Ok(fused_iterator)

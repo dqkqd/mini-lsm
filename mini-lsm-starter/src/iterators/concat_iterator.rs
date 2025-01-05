@@ -58,6 +58,31 @@ impl SstConcatIterator {
             sstables,
         })
     }
+
+    pub(crate) fn create_with_bound(
+        sstables: Vec<Arc<SsTable>>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<Self> {
+        for (sst_idx, table) in sstables.iter().enumerate() {
+            if let Ok(iter) = SsTableIterator::create_with_bound(table.clone(), lower, upper) {
+                if iter.is_valid() {
+                    return Ok(Self {
+                        current: Some(iter),
+                        next_sst_idx: sst_idx + 1,
+                        sstables,
+                    });
+                }
+            }
+        }
+
+        // Cannot find iterator.
+        Ok(Self {
+            current: None,
+            next_sst_idx: sstables.len(),
+            sstables,
+        })
+    }
 }
 
 impl StorageIterator for SstConcatIterator {
