@@ -17,8 +17,11 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -112,6 +115,51 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
+    fn build_ssts<I>(&self, mut iter: I, compact_to_bottom: bool) -> Result<Vec<Arc<SsTable>>>
+    where
+        I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+    {
+        let mut new_sstables = Vec::new();
+        let mut build = |builder: SsTableBuilder| -> Result<()> {
+            let sst_id = self.next_sst_id();
+            let path = self.path_of_sst(sst_id);
+            let table = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+            new_sstables.push(Arc::new(table));
+            Ok(())
+        };
+
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        while iter.is_valid() {
+            let (key, value) = (iter.key(), iter.value());
+
+            // do not add deleted key if compacting to bottom
+            if compact_to_bottom {
+                if !value.is_empty() {
+                    builder.add(key, value);
+                }
+            } else {
+                builder.add(key, value);
+            }
+
+            if builder.estimated_size() >= self.options.target_sst_size {
+                let oversized_builder =
+                    std::mem::replace(&mut builder, SsTableBuilder::new(self.options.block_size));
+                build(oversized_builder)?;
+            }
+
+            if iter.next().is_err() {
+                break;
+            }
+        }
+
+        // Make sure there is no left over (key, value).
+        if !builder.is_empty() {
+            build(builder)?;
+        }
+
+        Ok(new_sstables)
+    }
+
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
         match task {
             CompactionTask::ForceFullCompaction {
@@ -123,31 +171,23 @@ impl LsmStorageInner {
                     guard.sstables.clone()
                 };
 
-                let sstable_iters: Vec<Box<SsTableIterator>> = l0_sstables
+                let l0_iters: Vec<Box<SsTableIterator>> = l0_sstables
                     .iter()
-                    .chain(l1_sstables)
                     .filter_map(|sst_id| sstables.get(sst_id).cloned())
                     .filter_map(|table| SsTableIterator::create_and_seek_to_first(table).ok())
                     .map(Box::new)
                     .collect();
+                let l0_iters = MergeIterator::create(l0_iters);
 
-                let mut iter = MergeIterator::create(sstable_iters);
-                let mut new_sstables = Vec::new();
+                let l1_sstables: Vec<Arc<SsTable>> = l1_sstables
+                    .iter()
+                    .filter_map(|sst_id| sstables.get(sst_id).cloned())
+                    .collect();
+                let l1_iter = SstConcatIterator::create_and_seek_to_first(l1_sstables)?;
 
-                let mut build = |builder: SsTableBuilder| -> Result<()> {
-                    let sst_id = self.next_sst_id();
-                    let path = self.path_of_sst(sst_id);
-                    let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
-                    new_sstables.push(Arc::new(sstable));
-                    Ok(())
-                };
-
-                let mut builder = SsTableBuilder::new(self.options.block_size);
-                while iter.is_valid() {
-                    let (key, value) = (iter.key(), iter.value());
-                    // Do not include tombstone values.
-                    if !value.is_empty() {
-                        builder.add(key, value);
+                let iter = TwoMergeIterator::create(l0_iters, l1_iter)?;
+                self.build_ssts(iter, task.compact_to_bottom_level())
+            }
                     }
 
                     if builder.estimated_size() >= self.options.target_sst_size {
