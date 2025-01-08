@@ -345,25 +345,28 @@ impl LsmStorageInner {
             }
         }
 
-        // Find from l1 tables
+        // Find from `l1->...` tables
         if value.is_none() {
-            let sstables: Vec<Arc<SsTable>> = snapshot
+            value = snapshot
                 .levels
                 .iter()
-                .flat_map(|(_, sst_ids)| sst_ids.iter())
-                .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
-                // Use bloom filter.
-                .filter(|table| {
-                    table
-                        .bloom
-                        .as_ref()
-                        .is_some_and(|bloom| bloom.may_contain(keyhash))
+                .filter_map(|(_, sst_ids)| {
+                    let tables = sst_ids
+                        .iter()
+                        .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
+                        // Use bloom filter.
+                        .filter(|table| {
+                            table
+                                .bloom
+                                .as_ref()
+                                .is_some_and(|bloom| bloom.may_contain(keyhash))
+                        })
+                        .collect();
+                    let iter = SstConcatIterator::create_with_bound(tables, lower, upper);
+                    iter.ok()
                 })
-                .collect();
-            let iter = SstConcatIterator::create_with_bound(sstables, upper, lower)?;
-            if iter.is_valid() && iter.key() == key {
-                value = Some(Bytes::copy_from_slice(iter.value()))
-            }
+                .find(|iter| iter.is_valid() && iter.key() == key)
+                .map(|iter| Bytes::copy_from_slice(iter.value()));
         }
 
         // Filter out tombstone value.
@@ -496,15 +499,21 @@ impl LsmStorageInner {
             MergeIterator::create(l0_iters),
         )?;
 
-        let l1_sstables: Vec<Arc<SsTable>> = snapshot
+        let leveled_iters: Vec<Box<SstConcatIterator>> = snapshot
             .levels
             .iter()
-            .flat_map(|(_, sst_ids)| sst_ids.iter())
-            .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
+            .filter_map(|(_, sst_ids)| {
+                let sstables: Vec<Arc<SsTable>> = sst_ids
+                    .iter()
+                    .filter_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
+                    .collect();
+                SstConcatIterator::create_with_bound(sstables, lower, upper).ok()
+            })
+            .map(Box::new)
             .collect();
-        let l1_iters = SstConcatIterator::create_with_bound(l1_sstables, lower, upper)?;
+        let leveled_iters = MergeIterator::create(leveled_iters);
 
-        let iters = TwoMergeIterator::create(memtable_and_l0_iters, l1_iters)?;
+        let iters = TwoMergeIterator::create(memtable_and_l0_iters, leveled_iters)?;
         let lsm_iterator = LsmIterator::new(iters, lower, upper)?;
         let fused_iterator = FusedIterator::new(lsm_iterator);
 

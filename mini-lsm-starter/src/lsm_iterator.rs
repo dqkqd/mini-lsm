@@ -17,7 +17,7 @@ type LsmIteratorInner = TwoMergeIterator<
     // memtables and L0
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
     // L1 sst
-    SstConcatIterator,
+    MergeIterator<SstConcatIterator>,
 >;
 
 pub struct LsmIterator {
