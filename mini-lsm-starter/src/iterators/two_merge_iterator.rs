@@ -43,7 +43,12 @@ impl<
 
     /// Skip all the keys in b that equal the key in a
     fn skip_duplicated_keys(&mut self) -> Result<()> {
-        while self.a.is_valid() && self.b.is_valid() && self.b.key() <= self.a.key() {
+        // do not try to skip `b` if current iterator is not `a`, to avoid skipping valid keys.
+        while matches!(self.state, IteratorState::A)
+            && self.a.is_valid()
+            && self.b.is_valid()
+            && self.b.key() <= self.a.key()
+        {
             self.b.next()?;
         }
         Ok(())
