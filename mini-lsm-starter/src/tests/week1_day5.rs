@@ -129,6 +129,30 @@ fn test_task1_merge_5() {
 }
 
 #[test]
+fn test_task1_merge_6() {
+    let i1 = MockIterator::new(vec![
+        (Bytes::from("d"), Bytes::from("4.1")),
+        (Bytes::from("e"), Bytes::from("5.1")),
+    ]);
+    let i2 = MockIterator::new(vec![
+        (Bytes::from("a"), Bytes::from("1.2")),
+        (Bytes::from("b"), Bytes::from("2.2")),
+        (Bytes::from("c"), Bytes::from("3.2")),
+    ]);
+    let mut iter = TwoMergeIterator::create(i1, i2).unwrap();
+    check_iter_result_by_key(
+        &mut iter,
+        vec![
+            (Bytes::from("a"), Bytes::from("1.2")),
+            (Bytes::from("b"), Bytes::from("2.2")),
+            (Bytes::from("c"), Bytes::from("3.2")),
+            (Bytes::from("d"), Bytes::from("4.1")),
+            (Bytes::from("e"), Bytes::from("5.1")),
+        ],
+    )
+}
+
+#[test]
 fn test_task2_storage_scan() {
     let dir = tempdir().unwrap();
     let storage =
