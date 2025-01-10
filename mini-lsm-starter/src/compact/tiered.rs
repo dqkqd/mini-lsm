@@ -46,7 +46,7 @@ impl TieredCompactionController {
 
             let ratio = upper_levels_size as f64 * 100.0 / last_level_size as f64;
             if ratio >= self.options.max_size_amplification_percent as f64 {
-                eprintln!("compaction triggered by space amplification ratio: {ratio}");
+                println!("compaction triggered by space amplification ratio: {ratio}");
                 return Some(TieredCompactionTask {
                     tiers: snapshot.levels.clone(),
                     bottom_tier_included: true,
@@ -56,25 +56,39 @@ impl TieredCompactionController {
 
         // Trigger by size ratio
         let mut previous_tier_size = 0.0;
-        let size_ratio = 100.0 + self.options.size_ratio as f64;
+        let size_ratio = (100.0 + self.options.size_ratio as f64) / 100.0;
         for (i, (_, levels)) in snapshot.levels.iter().enumerate() {
             // Only do compaction if there are more than `min_merge_width` tiers to be merged.
-            if i + 1 >= self.options.min_merge_width && previous_tier_size != 0.0 {
-                let current_size_ratio = levels.len() as f64 * 100.0 / previous_tier_size;
+            if i >= self.options.min_merge_width && previous_tier_size != 0.0 {
+                let current_size_ratio = levels.len() as f64 / previous_tier_size;
                 if current_size_ratio > size_ratio {
-                    eprintln!(
-                        "compaction triggered by size ratio: {current_size_ratio} > {size_ratio}"
+                    println!(
+                        "compaction triggered by size ratio: {} > {}",
+                        current_size_ratio * 100.0,
+                        size_ratio * 100.0
                     );
                     return Some(TieredCompactionTask {
                         tiers: snapshot.levels.iter().take(i).cloned().collect(),
-                        bottom_tier_included: i >= snapshot.levels.len() - 1,
+                        // Because we always compact all tiers excluding the last one, this
+                        // compaction will never include the bottom tier.
+                        bottom_tier_included: false,
                     });
                 }
             }
             previous_tier_size += levels.len() as f64;
         }
 
-        todo!()
+        let max_num_tiers = self.options.max_merge_width.unwrap_or(usize::MAX);
+        println!("compaction triggered by reducing sorted runs");
+        Some(TieredCompactionTask {
+            tiers: snapshot
+                .levels
+                .iter()
+                .take(max_num_tiers)
+                .cloned()
+                .collect(),
+            bottom_tier_included: max_num_tiers >= snapshot.levels.len(),
+        })
     }
 
     pub fn apply_compaction_result(
@@ -93,15 +107,10 @@ impl TieredCompactionController {
             .collect();
 
         let mut new_snapshot = snapshot.clone();
-        // tier_id is generated based on the first sst_id.
-        let next_tier_id = new_snapshot
-            .levels
-            .iter()
-            .filter_map(|(_, sst_ids)| sst_ids.first())
-            .next()
-            .cloned()
-            .expect("snapshot should contain at least one sst")
-            + 1;
+        // tier_id is generated based on the first sst_id from output.
+        let next_tier_id = output
+            .first()
+            .expect("output should contain at least one sst_id");
 
         // Delete the first tier.
         if let Some((first_tier, first_sst_ids)) = new_snapshot.levels.first_mut() {
@@ -121,9 +130,9 @@ impl TieredCompactionController {
             .unwrap_or(new_snapshot.levels.len());
         new_snapshot
             .levels
-            .insert(index, (next_tier_id, output.to_vec()));
+            .insert(index, (*next_tier_id, output.to_vec()));
 
-        // Remove iters should be deleted or those emptied.
+        // Remove deleted iterators or those are emptied.
         new_snapshot
             .levels
             .retain(|(tier, sst_ids)| !should_delete_tiers.contains(tier) && !sst_ids.is_empty());

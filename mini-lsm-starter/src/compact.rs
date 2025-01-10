@@ -1,5 +1,3 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
 mod leveled;
 mod simple_leveled;
 mod tiered;
@@ -244,8 +242,29 @@ impl LsmStorageInner {
                     }
                 }
             }
+            CompactionTask::Tiered(tiered_compaction_task) => {
+                let snapshot = {
+                    let guard = self.state.read();
+                    guard.clone()
+                };
+
+                let iters: Vec<Box<SstConcatIterator>> = tiered_compaction_task
+                    .tiers
+                    .iter()
+                    .map(|(_, sst_ids)| {
+                        sst_ids
+                            .iter()
+                            .flat_map(|sst_id| snapshot.sstables.get(sst_id).cloned())
+                            .collect()
+                    })
+                    .flat_map(SstConcatIterator::create_and_seek_to_first)
+                    .map(Box::new)
+                    .collect();
+
+                let iter = MergeIterator::create(iters);
+                self.build_ssts(iter, task.compact_to_bottom_level())
+            }
             CompactionTask::Leveled(_) => unimplemented!(),
-            CompactionTask::Tiered(_) => unimplemented!(),
         }
     }
 
