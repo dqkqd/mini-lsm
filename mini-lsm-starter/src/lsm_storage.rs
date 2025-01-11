@@ -1,7 +1,7 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -22,7 +22,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -47,8 +47,8 @@ pub struct LsmStorageState {
     pub l0_sstables: Vec<usize>,
     /// SsTables sorted by key range; L1 - L_max for leveled compaction, or tiers for tiered
     /// compaction.
-    pub levels: Vec<(usize, Vec<usize>)>,
     /// SST objects.
+    pub levels: Vec<(usize, Vec<usize>)>,
     pub sstables: HashMap<usize, Arc<SsTable>>,
 }
 
@@ -420,7 +420,8 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -453,20 +454,31 @@ impl LsmStorageInner {
             let path = self.path_of_sst(sst_id);
             let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
 
-            let _state_lock = self.state_lock.lock();
-            let mut state = self.state.write();
-            let mut new_state = state.as_ref().clone();
+            {
+                let _state_lock = self.state_lock.lock();
+                let mut state = self.state.write();
+                let mut new_state = state.as_ref().clone();
 
-            new_state.imm_memtables.pop();
+                new_state.imm_memtables.pop();
 
-            if self.compaction_controller.flush_to_l0() {
-                new_state.l0_sstables.insert(0, sst_id);
-            } else {
-                new_state.levels.insert(0, (sst_id, vec![sst_id]));
+                if self.compaction_controller.flush_to_l0() {
+                    new_state.l0_sstables.insert(0, sst_id);
+                } else {
+                    new_state.levels.insert(0, (sst_id, vec![sst_id]));
+                }
+                new_state.sstables.insert(sst_id, Arc::new(sstable));
+
+                *state = Arc::new(new_state);
             }
-            new_state.sstables.insert(sst_id, Arc::new(sstable));
 
-            *state = Arc::new(new_state);
+            // record
+            if let Some(manifest) = self.manifest.as_ref() {
+                self.sync_dir()?;
+                manifest.add_record(
+                    &self.state_lock.lock(),
+                    ManifestRecord::Flush(memtable.id()),
+                )?;
+            }
         }
 
         Ok(())

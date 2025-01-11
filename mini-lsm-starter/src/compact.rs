@@ -21,6 +21,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -342,6 +343,7 @@ impl LsmStorageInner {
             l1_sstables,
         };
         let sstables = self.compact(&task)?;
+        let new_sst_ids: Vec<usize> = sstables.iter().map(|table| table.sst_id()).collect();
 
         {
             let _state_lock = self.state_lock.lock();
@@ -370,6 +372,14 @@ impl LsmStorageInner {
         // Remove staled files
         for sst_id in compacting_sst_ids {
             fs::remove_file(self.path_of_sst(sst_id))?
+        }
+
+        if let Some(manifest) = self.manifest.as_ref() {
+            self.sync_dir()?;
+            manifest.add_record(
+                &self.state_lock.lock(),
+                ManifestRecord::Compaction(task, new_sst_ids),
+            )?;
         }
 
         Ok(())
@@ -406,6 +416,14 @@ impl LsmStorageInner {
             // Remove staled files
             for sst_id in compacting_sst_ids {
                 fs::remove_file(self.path_of_sst(sst_id))?
+            }
+
+            if let Some(manifest) = self.manifest.as_ref() {
+                self.sync_dir()?;
+                manifest.add_record(
+                    &self.state_lock.lock(),
+                    ManifestRecord::Compaction(task, new_sst_ids),
+                )?;
             }
         }
 
