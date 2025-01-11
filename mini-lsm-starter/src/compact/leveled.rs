@@ -173,7 +173,7 @@ impl LeveledCompactionController {
         snapshot: &LsmStorageState,
         task: &LeveledCompactionTask,
         output: &[usize],
-        _in_recovery: bool,
+        in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         let mut new_snapshot = snapshot.clone();
         let deleted_sst_ids: BTreeSet<usize> = task
@@ -192,26 +192,31 @@ impl LeveledCompactionController {
         let lower_level_sst_ids = &mut new_snapshot.levels[task.lower_level - 1].1;
         lower_level_sst_ids.retain(|sst_id| !deleted_sst_ids.contains(sst_id));
 
-        let first_key = {
-            let sst_id = output[0];
-            let table = new_snapshot
-                .sstables
-                .get(&sst_id)
-                .expect("sstables should contains output's sst_id");
-            table.first_key()
-        };
+        // If we are in recovery mode, do not try to sort as we don't have correct `first_key`.
+        if in_recovery {
+            lower_level_sst_ids.extend_from_slice(output);
+        } else {
+            let first_key = {
+                let sst_id = output[0];
+                let table = new_snapshot
+                    .sstables
+                    .get(&sst_id)
+                    .expect("sstables should contains output's sst_id");
+                table.first_key()
+            };
 
-        let insert_index = lower_level_sst_ids.partition_point(|sst_id| {
-            let table = new_snapshot.sstables.get(sst_id).unwrap();
-            table.first_key() <= first_key
-        });
+            let insert_index = lower_level_sst_ids.partition_point(|sst_id| {
+                let table = new_snapshot.sstables.get(sst_id).unwrap();
+                table.first_key() <= first_key
+            });
 
-        *lower_level_sst_ids = [
-            &lower_level_sst_ids[..insert_index],
-            output,
-            &lower_level_sst_ids[insert_index..],
-        ]
-        .concat();
+            *lower_level_sst_ids = [
+                &lower_level_sst_ids[..insert_index],
+                output,
+                &lower_level_sst_ids[insert_index..],
+            ]
+            .concat();
+        }
 
         (new_snapshot, deleted_sst_ids.into_iter().collect())
     }

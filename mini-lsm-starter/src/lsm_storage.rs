@@ -25,7 +25,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -280,7 +280,7 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
-        let storage = Self {
+        let mut storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
@@ -292,6 +292,9 @@ impl LsmStorageInner {
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
+
+        let manifest = storage.recover_from_manifest()?;
+        storage.manifest = Some(manifest);
 
         Ok(storage)
     }
@@ -408,6 +411,10 @@ impl LsmStorageInner {
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.put(key, &TOMBSTONE)
+    }
+
+    pub(crate) fn path_of_manifest(&self) -> PathBuf {
+        self.path.join("MANIFEST")
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -545,5 +552,80 @@ impl LsmStorageInner {
         let fused_iterator = FusedIterator::new(lsm_iterator);
 
         Ok(fused_iterator)
+    }
+
+    fn recover_from_manifest(&mut self) -> Result<Manifest> {
+        let manifest_path = self.path_of_manifest();
+
+        match Manifest::recover(&manifest_path) {
+            // Invalid manifest. Create a new one.
+            Err(_) => Ok(Manifest::create(&manifest_path)?),
+
+            // Valid manifest, try to recover.
+            Ok((manifest, records)) => {
+                let mut state = self.state.write();
+                let mut new_state = state.as_ref().clone();
+
+                // Simulate actions.
+                for record in records {
+                    match record {
+                        ManifestRecord::Compaction(task, sst_ids) => {
+                            (new_state, _) = self
+                                .compaction_controller
+                                .apply_compaction_result(&new_state, &task, &sst_ids, true);
+                        }
+                        ManifestRecord::Flush(sst_id) => {
+                            if self.compaction_controller.flush_to_l0() {
+                                new_state.l0_sstables.insert(0, sst_id);
+                            } else {
+                                new_state.levels.insert(0, (sst_id, vec![sst_id]));
+                            }
+                        }
+                        ManifestRecord::NewMemtable(_) => todo!(),
+                    }
+                }
+
+                // Restore sstables hash map.
+                for sst_id in new_state
+                    .levels
+                    .iter()
+                    .flat_map(|(_, sst_ids)| sst_ids)
+                    .chain(&new_state.l0_sstables)
+                    .cloned()
+                {
+                    let path = self.path_of_sst(sst_id);
+                    let file_object = FileObject::open(&path)?;
+                    let table = SsTable::open(sst_id, None, file_object)?;
+                    new_state.sstables.insert(sst_id, Arc::new(table));
+                }
+
+                let mut max_sst_id = 0;
+
+                // Sort sst ids in lower levels.
+                for (_, sst_ids) in new_state.levels.iter_mut() {
+                    if let Some(sst_id) = sst_ids.iter().max() {
+                        max_sst_id = max_sst_id.max(*sst_id)
+                    }
+                    sst_ids.sort_unstable_by_key(|sst_id| {
+                        let table = new_state
+                            .sstables
+                            .get(sst_id)
+                            .unwrap_or_else(|| panic!("cannot read sstable for {sst_id}"));
+                        table.first_key()
+                    });
+                }
+
+                // update next sst id and change the id of the current memtable
+                self.next_sst_id
+                    .store(max_sst_id, std::sync::atomic::Ordering::SeqCst);
+                let id = self.next_sst_id();
+                let memtable = MemTable::create(id);
+                new_state.memtable = Arc::new(memtable);
+
+                *state = Arc::new(new_state);
+
+                Ok(manifest)
+            }
+        }
     }
 }
