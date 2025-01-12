@@ -5,6 +5,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 
+use super::validate_checksum;
+
 /// Implements a bloom filter
 pub struct Bloom {
     /// data of filter in bits
@@ -48,7 +50,11 @@ impl<T: AsMut<[u8]>> BitSliceMut for T {
 
 impl Bloom {
     /// Decode a bloom filter
+    /// Bloom format layout:
+    /// | filter | k | checksum |
     pub fn decode(buf: &[u8]) -> Result<Self> {
+        let buf = validate_checksum(buf)?;
+
         let filter = &buf[..buf.len() - 1];
         let k = buf[buf.len() - 1];
         Ok(Self {
@@ -58,9 +64,17 @@ impl Bloom {
     }
 
     /// Encode a bloom filter
+    /// Bloom format layout:
+    /// | filter | k | checksum |
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        let offset = buf.len();
+
         buf.extend(&self.filter);
         buf.put_u8(self.k);
+
+        let data = &buf[offset..];
+        let checksum = crc32fast::hash(data);
+        buf.extend_from_slice(&checksum.to_le_bytes());
     }
 
     /// Get bloom filter bits per key from entries count and FPR

@@ -7,15 +7,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use bloom::Bloom;
 pub use builder::SsTableBuilder;
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
 use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
-
-use self::bloom::Bloom;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -31,27 +30,29 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
+    /// Each BlockMeta has the following layout:
+    /// | offset | first_key_len | first_key | last_key_len | last_key |
+    /// The whole block meta list has checksum at the end.
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
-        // the number of blocks
-        let number_blocks = block_meta.len();
-        if number_blocks >= u32::MAX as usize {
-            panic!("too many block meta");
-        }
-        buf.extend_from_slice(&(block_meta.len() as u32).to_le_bytes());
+        let offset = buf.len();
 
+        buf.extend_from_slice(&(block_meta.len() as u32).to_le_bytes());
         for block in block_meta {
-            if block.offset >= u32::MAX as usize {
-                panic!("block meta offset must less than u32");
-            }
             buf.extend_from_slice(&(block.offset as u32).to_le_bytes());
             buf.extend_from_slice(&(block.first_key.len() as u16).to_le_bytes());
             buf.extend_from_slice(block.first_key.raw_ref());
             buf.extend_from_slice(&(block.last_key.len() as u16).to_le_bytes());
             buf.extend_from_slice(block.last_key.raw_ref());
         }
+
+        let data = &buf[offset..];
+        let checksum = crc32fast::hash(data);
+        buf.extend_from_slice(&checksum.to_le_bytes());
     }
 
     /// Decode block meta from a buffer.
+    /// Each BlockMeta has the following layout:
+    /// | offset | first_key_len | first_key | last_key_len | last_key |
     pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
         let number_blocks = buf.get_u32_le() as usize;
 
@@ -149,8 +150,10 @@ impl SsTable {
 
     /// Open SSTable from a file.
     ///
-    /// The layout was saved like this:
-    /// | data block | data block | .... | meta block | bloom filter | meta block offset | bloom filter offset |
+    /// A SSTable has the following layout:
+    ///
+    /// | data block | data block checksum | data block | data block checksum | .... | meta block | meta block checksum
+    /// | bloom filter | bloom filter checksum | meta block offset | bloom filter offset |
     ///
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         // offsets
@@ -167,11 +170,14 @@ impl SsTable {
         // Read the whole block meta and bloom (instead of reading separately), to avoid disk seek.
         let mut meta = file.read(block_meta_offset, block_meta_size + bloom_filter_size)?;
         let bloom = meta.split_off(block_meta_size as usize);
-        let block_meta = meta;
 
+        // Checksum will be checked during bloom decoding.
         let bloom = Bloom::decode(&bloom)?;
 
-        let block_meta = BlockMeta::decode_block_meta(Bytes::from(block_meta));
+        // Since we encode a list of block meta, we validate the checksum here.
+        let block_meta = validate_checksum(&meta)?;
+        let block_meta = BlockMeta::decode_block_meta(block_meta);
+
         let first_key = BlockMeta::first_key(&block_meta);
         let last_key = BlockMeta::last_key(&block_meta);
 
