@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs::File, io::BufReader};
@@ -7,9 +7,9 @@ use std::{fs::File, io::BufReader};
 use anyhow::Result;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
-use serde_json::Deserializer;
 
 use crate::compact::CompactionTask;
+use crate::table::validate_checksum;
 
 pub struct Manifest {
     file: Arc<Mutex<File>>,
@@ -20,6 +20,40 @@ pub enum ManifestRecord {
     Flush(usize),
     NewMemtable(usize),
     Compaction(CompactionTask, Vec<usize>),
+}
+
+impl ManifestRecord {
+    /// Record should have format
+    /// | len | json | checksum |
+    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
+        let record = serde_json::to_vec(self)?;
+        let record_len = (record.len() as u16).to_le_bytes();
+
+        let mut data = record_len.to_vec();
+        data.extend_from_slice(&record);
+
+        let checksum = crc32fast::hash(&data);
+        data.extend_from_slice(&checksum.to_le_bytes());
+
+        writer.write_all(&data)?;
+        Ok(())
+    }
+
+    /// Record should have format
+    /// | len | json | checksum |
+    fn from_reader<R: Read>(reader: &mut R) -> Result<Self> {
+        let mut data = vec![0; 2];
+        reader.read_exact(&mut data[..2])?;
+
+        let record_len = u16::from_le_bytes([data[0], data[1]]);
+        data.resize(record_len as usize + 2 + 4, 0);
+        reader.read_exact(&mut data[2..])?;
+
+        let data = validate_checksum(&data)?;
+        let record: ManifestRecord = serde_json::from_slice(&data[2..])?;
+
+        Ok(record)
+    }
 }
 
 impl Manifest {
@@ -33,10 +67,9 @@ impl Manifest {
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
 
-        let buf = BufReader::new(&file);
+        let mut buf = BufReader::new(&file);
         let mut records: Vec<ManifestRecord> = Vec::new();
-        let stream = Deserializer::from_reader(buf).into_iter::<ManifestRecord>();
-        for record in stream.flatten() {
+        while let Ok(record) = ManifestRecord::from_reader(&mut buf) {
             records.push(record)
         }
 
@@ -57,7 +90,8 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
-        let bytes = serde_json::to_vec(&record)?;
+        let mut bytes = Vec::new();
+        record.to_writer(&mut bytes)?;
         self.file.lock().write_all(&bytes)?;
         Ok(())
     }
