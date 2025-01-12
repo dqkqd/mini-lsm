@@ -39,6 +39,31 @@ fn test_integration_simple() {
     }));
 }
 
+#[test]
+fn test_recover_memtable() {
+    let dir = tempdir().unwrap();
+    let compaction_options = CompactionOptions::Simple(SimpleLeveledCompactionOptions {
+        size_ratio_percent: 200,
+        level0_file_num_compaction_trigger: 2,
+        max_levels: 3,
+    });
+    let mut options = LsmStorageOptions::default_for_week2_test(compaction_options);
+    options.enable_wal = true;
+
+    let storage = MiniLsm::open(&dir, options.clone()).unwrap();
+    storage.put(b"0", b"v0").unwrap();
+    storage.close().unwrap();
+
+    // ensure SST is not flushed
+    assert!(!storage.inner.state.read().memtable.is_empty());
+    storage.dump_structure();
+    drop(storage);
+    dump_files_in_dir(&dir);
+
+    let storage = MiniLsm::open(&dir, options).unwrap();
+    assert_eq!(&storage.get(b"0").unwrap().unwrap()[..], b"v0".as_slice());
+}
+
 fn test_integration(compaction_options: CompactionOptions) {
     let dir = tempdir().unwrap();
     let mut options = LsmStorageOptions::default_for_week2_test(compaction_options);
