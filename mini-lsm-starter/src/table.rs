@@ -211,6 +211,7 @@ impl SsTable {
     }
 
     /// Read a block from the disk.
+    /// We also validate the block data using checksum.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
         let block_meta_offset = self
             .block_meta
@@ -224,12 +225,13 @@ impl SsTable {
             .map(|b| b.offset)
             .unwrap_or(self.block_meta_offset);
 
-        let block_data = self.file.read(
+        let block_data_and_checksum = self.file.read(
             block_meta_offset as u64,
             (next_block_meta_offset - block_meta_offset) as u64,
         )?;
 
-        let block = Block::decode(&block_data);
+        let block_data = validate_checksum(&block_data_and_checksum)?;
+        let block = Block::decode(block_data);
 
         Ok(Arc::new(block))
     }
@@ -310,4 +312,20 @@ impl SsTable {
     pub fn max_ts(&self) -> u64 {
         self.max_ts
     }
+}
+
+/// Validate checksum for given data.
+/// Checksum is always a 32 bit integer append at the end of data.
+pub(crate) fn validate_checksum(data_and_checksum: &[u8]) -> Result<&[u8]> {
+    let (data, expected_checksum) = data_and_checksum
+        .split_last_chunk::<4>()
+        .with_context(|| "data do not contain checksum")?;
+    let expected_checksum = u32::from_le_bytes(*expected_checksum);
+    let checksum = crc32fast::hash(data);
+
+    if checksum != expected_checksum {
+        bail!("checksum does not match")
+    }
+
+    Ok(data)
 }

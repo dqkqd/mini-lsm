@@ -55,6 +55,7 @@ impl SsTableBuilder {
     }
 
     /// Split current block and allocate a new one to accept keys.
+    /// We also calculate and save the checksum for the current block before moving to other blocks.
     fn split(&mut self) {
         // Take the current `self.builder` out.
         let builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
@@ -90,8 +91,15 @@ impl SsTableBuilder {
             last_key,
         });
 
-        self.data.extend_from_slice(block.encode().as_ref());
+        // Calculate current block checksum.
+        let block_data = block.encode();
+        let block_data = block_data.as_ref();
+        let checksum = crc32fast::hash(block_data);
+
+        self.data.extend_from_slice(block_data);
+        self.data.extend(checksum.to_le_bytes());
     }
+
     /// Whether the SSTable is empty.
     ///
     /// A SSTable is empty if and only if it has no data, and there is no incoming data in the
