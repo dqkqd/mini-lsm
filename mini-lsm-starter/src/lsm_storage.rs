@@ -399,15 +399,21 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
-    }
-
-    /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let memtable_reaches_capacity = {
             let state = self.state.read();
-            state.memtable.put(key, value)?;
+            let data: Vec<(KeySlice, &[u8])> = batch
+                .iter()
+                .map(|record| match record {
+                    WriteBatchRecord::Put(key, value) => {
+                        (KeySlice::from_slice(key.as_ref()), value.as_ref())
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        (KeySlice::from_slice(key.as_ref()), TOMBSTONE.as_ref())
+                    }
+                })
+                .collect();
+            state.memtable.put_batch(&data)?;
             state.memtable.approximate_size() >= self.options.target_sst_size
         };
 
@@ -421,9 +427,14 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Put a key-value pair into the storage by writing into the current memtable.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Put(key, value)])
+    }
+
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.put(key, &TOMBSTONE)
+        self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
     pub(crate) fn path_of_manifest(&self) -> PathBuf {

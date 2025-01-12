@@ -117,8 +117,27 @@ impl MemTable {
     }
 
     /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            let data: Vec<(&[u8], &[u8])> = data
+                .iter()
+                .map(|&(key, value)| (key.raw_ref(), value))
+                .collect();
+            wal.put_batch(&data)?;
+        }
+
+        let mut size = 0;
+        for (key, value) in data {
+            let key = Bytes::copy_from_slice(key.raw_ref());
+            let value = Bytes::copy_from_slice(value);
+            size += key.len() + value.len();
+            self.map.insert(key, value);
+        }
+
+        self.approximate_size
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {

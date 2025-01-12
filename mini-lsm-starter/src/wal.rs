@@ -38,15 +38,17 @@ impl Wal {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut buf = self.file.lock();
-        add_data_u16(buf.by_ref(), key)?;
-        add_data_u16(buf.by_ref(), value)?;
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(&[u8], &[u8])]) -> Result<()> {
+        let mut buf = self.file.lock();
+        for (key, value) in data {
+            add_data_u16(buf.by_ref(), key)?;
+            add_data_u16(buf.by_ref(), value)?;
+        }
+        Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {
