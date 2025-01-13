@@ -11,7 +11,7 @@ use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT};
 use crate::table::SsTableBuilder;
 use crate::wal::Wal;
 
@@ -117,27 +117,28 @@ impl MemTable {
     }
 
     /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        if let Some(wal) = &self.wal {
-            let data: Vec<(&[u8], &[u8])> = data
-                .iter()
-                .map(|&(key, value)| (key.raw_ref(), value))
-                .collect();
-            wal.put_batch(&data)?;
-        }
-
-        let mut size = 0;
-        for (key, value) in data {
-            let key = Bytes::copy_from_slice(key.raw_ref());
-            let value = Bytes::copy_from_slice(value);
-            size += key.len() + value.len();
-            self.map.insert(key, value);
-        }
-
-        self.approximate_size
-            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-
-        Ok(())
+    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
+        todo!()
+        // if let Some(wal) = &self.wal {
+        //     let data: Vec<(&[u8], &[u8])> = data
+        //         .iter()
+        //         .map(|&(key, value)| (key.raw_ref(), value))
+        //         .collect();
+        //     wal.put_batch(&data)?;
+        // }
+        //
+        // let mut size = 0;
+        // for (key, value) in data {
+        //     let key = Bytes::copy_from_slice(key.raw_ref());
+        //     let value = Bytes::copy_from_slice(value);
+        //     size += key.len() + value.len();
+        //     self.map.insert(key, value);
+        // }
+        //
+        // self.approximate_size
+        //     .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        //
+        // Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {
@@ -170,7 +171,7 @@ impl MemTable {
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
         for entry in self.map.iter() {
-            let key = KeySlice::from_slice(entry.key());
+            let key = KeySlice::from_slice(entry.key(), TS_DEFAULT);
             let value = entry.value();
             builder.add(key, value);
         }
@@ -220,7 +221,7 @@ impl StorageIterator for MemTableIterator {
     }
 
     fn key(&self) -> KeySlice {
-        KeySlice::from_slice(self.borrow_item().0.as_ref())
+        KeySlice::from_slice(self.borrow_item().0.as_ref(), TS_DEFAULT)
     }
 
     fn is_valid(&self) -> bool {

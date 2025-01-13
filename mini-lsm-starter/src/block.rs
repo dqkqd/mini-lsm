@@ -5,15 +5,15 @@ pub use builder::BlockBuilder;
 use bytes::Bytes;
 pub use iterator::BlockIterator;
 
-use crate::key::KeyVec;
+use crate::{key::KeyVec, U16_SIZE, U64_SIZE};
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct BlockKey {
     pub key: KeyVec,
     pub range: (usize, usize),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct BlockData<'a> {
     data: &'a [u8],
     range: (usize, usize),
@@ -21,8 +21,13 @@ pub(crate) struct BlockData<'a> {
 
 impl From<BlockData<'_>> for BlockKey {
     fn from(block_data: BlockData<'_>) -> Self {
+        let (key, ts) = block_data.data.split_last_chunk::<U64_SIZE>().unwrap();
+
+        let ts = u64::from_le_bytes(*ts);
+        let key = KeyVec::from_vec_with_ts(key.to_vec(), ts);
+
         Self {
-            key: KeyVec::from_vec(block_data.data.to_vec()),
+            key,
             range: block_data.range,
         }
     }
@@ -55,14 +60,14 @@ impl Block {
     }
 
     fn decode_checked(data: &[u8]) -> Option<Self> {
-        let num_elements = u16_at(data, (data.len() - 2) as u16)?;
+        let num_elements = u16_at(data, (data.len() - U16_SIZE) as u16)?;
 
-        let data = &data[..data.len() - 2];
+        let data = &data[..data.len() - U16_SIZE];
         let offset_start = data.len().checked_sub(num_elements as usize * 2)?;
         let (data, offsets) = data.split_at_checked(offset_start)?;
 
         let offsets: Vec<u16> = offsets
-            .chunks(2)
+            .chunks(U16_SIZE)
             .filter_map(|chunk| u16_at(chunk, 0))
             .collect();
 
@@ -90,24 +95,24 @@ impl Block {
     // Return a key position at specific offset.
     pub(crate) fn key_at_offset(&self, offset: u16) -> Option<BlockKey> {
         if offset == 0 {
-            // The first key is saved same as normal data.
+            // The first key is saved same as normal data with additional timestamp.
             self.data_at_offset(offset).map(BlockKey::from)
         } else {
             // Other keys is saved using prefixed encoding
-            // | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len)
+            // | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | timestamp |
             let key_overlap_len = self.sizehint_at_offset(offset)?;
-            let rest_key = self.data_at_offset(offset + 2)?;
+            let rest_key: BlockKey = self.data_at_offset(offset + 2)?.into();
 
             let first_key = self.first_key.as_ref()?;
 
             let key = [
-                &first_key.raw_ref()[..key_overlap_len as usize],
-                rest_key.data,
+                &first_key.key_ref()[..key_overlap_len as usize],
+                rest_key.key.key_ref(),
             ]
             .concat();
 
             Some(BlockKey {
-                key: KeyVec::from_vec(key),
+                key: KeyVec::from_vec_with_ts(key, rest_key.key.ts()),
                 range: rest_key.range,
             })
         }
@@ -128,14 +133,14 @@ impl Block {
 fn u16_at(data: &[u8], at: u16) -> Option<u16> {
     let offset = at as usize;
     let data = &data[offset..];
-    let (data_len, _) = data.split_first_chunk::<2>()?;
+    let (data_len, _) = data.split_first_chunk::<U16_SIZE>()?;
     Some(u16::from_le_bytes(*data_len))
 }
 
 fn data_at(data: &[u8], at: u16) -> Option<BlockData> {
     let data_len = u16_at(data, at)?;
-    let from = (at + 2) as usize;
-    let to = (at + 2 + data_len) as usize;
+    let from = at as usize + U16_SIZE;
+    let to = from + data_len as usize;
     Some(BlockData {
         data: &data[from..to],
         range: (from, to),

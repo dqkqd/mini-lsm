@@ -6,7 +6,11 @@ use std::{
 use anyhow::{bail, Context, Result};
 
 use super::SsTable;
-use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
+use crate::{
+    block::BlockIterator,
+    iterators::StorageIterator,
+    key::{KeySlice, TS_DEFAULT},
+};
 
 /// An iterator over the contents of an SSTable.
 pub struct SsTableIterator {
@@ -88,8 +92,8 @@ impl SsTableIterator {
 
         // Provided range.
         let range = Range {
-            start: lower.map(KeySlice::from_slice),
-            end: upper.map(KeySlice::from_slice),
+            start: lower.map(|data| KeySlice::from_slice(data, TS_DEFAULT)),
+            end: upper.map(|data| KeySlice::from_slice(data, TS_DEFAULT)),
         };
         let range = range_overlap(range, table_range)
             .with_context(|| "provided range does not overlap with table")?;

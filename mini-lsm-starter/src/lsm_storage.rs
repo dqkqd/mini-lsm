@@ -20,7 +20,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
@@ -340,10 +340,10 @@ impl LsmStorageInner {
         }
 
         // Find value in disk.
-        let key = KeySlice::from_slice(key);
-        let keyhash = farmhash::fingerprint32(key.raw_ref());
-        let lower = Bound::Included(key.raw_ref());
-        let upper = Bound::Included(key.raw_ref());
+        let key = KeySlice::from_slice(key, TS_DEFAULT);
+        let keyhash = farmhash::fingerprint32(key.key_ref());
+        let lower = Bound::Included(key.key_ref());
+        let upper = Bound::Included(key.key_ref());
 
         // Find from l0 tables.
         {
@@ -405,15 +405,21 @@ impl LsmStorageInner {
             let data: Vec<(KeySlice, &[u8])> = batch
                 .iter()
                 .map(|record| match record {
-                    WriteBatchRecord::Put(key, value) => {
-                        (KeySlice::from_slice(key.as_ref()), value.as_ref())
-                    }
-                    WriteBatchRecord::Del(key) => {
-                        (KeySlice::from_slice(key.as_ref()), TOMBSTONE.as_ref())
-                    }
+                    WriteBatchRecord::Put(key, value) => (
+                        KeySlice::from_slice(key.as_ref(), TS_DEFAULT),
+                        value.as_ref(),
+                    ),
+                    WriteBatchRecord::Del(key) => (
+                        KeySlice::from_slice(key.as_ref(), TS_DEFAULT),
+                        TOMBSTONE.as_ref(),
+                    ),
                 })
                 .collect();
-            state.memtable.put_batch(&data)?;
+            for (key, value) in data {
+                // TODO: should this has ts as well?
+                state.memtable.put(key.key_ref(), value)?;
+            }
+            // state.memtable.put_batch(&data)?;
             state.memtable.approximate_size() >= self.options.target_sst_size
         };
 

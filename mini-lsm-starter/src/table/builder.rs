@@ -74,7 +74,7 @@ impl SsTableBuilder {
                 .offsets
                 .iter()
                 .filter_map(|offset| block.key_at_offset(*offset))
-                .map(|position| farmhash::fingerprint32(position.key.raw_ref())),
+                .map(|position| farmhash::fingerprint32(position.key.key_ref())),
         );
 
         let offset = self.data.len();

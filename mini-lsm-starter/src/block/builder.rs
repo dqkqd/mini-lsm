@@ -1,4 +1,7 @@
-use crate::key::{KeySlice, KeyVec};
+use crate::{
+    key::{KeySlice, KeyVec},
+    U16_SIZE, U64_SIZE,
+};
 
 use super::Block;
 
@@ -53,14 +56,23 @@ impl BlockBuilder {
         }
     }
 
-    /// Add the first key into block. This operation is always return true.
+    /// Add the first key into block.
+    /// We don't check key, value size this time, so the operation always succeeds.
     /// The layout should be:
-    /// | key len (u16) | key | value len (u16) | value |
+    /// | key len (u16) | key | timestamp | value len (u16) | value |
     fn add_first_key_value(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        self.offsets.push(self.data.len() as u16);
         self.first_key = Some(key.to_key_vec());
-        self.add_data_u16(key.raw_ref());
-        self.add_data_u16(value);
+
+        self.offsets.push(self.data.len() as u16);
+
+        let key_len = key.raw_len() as u16;
+        self.data.extend_from_slice(&key_len.to_le_bytes());
+        self.data.extend_from_slice(key.key_ref());
+        self.data.extend_from_slice(&key.ts().to_le_bytes());
+
+        let value_len = value.len() as u16;
+        self.data.extend_from_slice(&value_len.to_le_bytes());
+        self.data.extend_from_slice(value);
 
         true
     }
@@ -69,33 +81,32 @@ impl BlockBuilder {
     /// This operation will be failed if the new size exceed total block size.
     ///
     /// The layout should be:
-    /// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | value len (u16) | value |
+    /// | key_overlap_len (u16) | rest_key_len and timestamp (u16) | rest_key | timestamp | value len (u16) | value |
     fn add_key_value_prefixed_encoding(&mut self, key: KeySlice, value: &[u8]) -> bool {
         let first_key = self.first_key.as_ref().unwrap();
 
-        let key_overlap_len = shared_prefix_length(first_key.raw_ref(), key.raw_ref());
-        let rest_key = &key.raw_ref()[key_overlap_len..];
+        let key_overlap_len = shared_prefix_length(first_key.key_ref(), key.key_ref());
+        let rest_key = &key.key_ref()[key_overlap_len..];
 
-        let total_len = 2 + 2 + rest_key.len() + 2 + value.len();
+        let total_len = U16_SIZE + U16_SIZE + rest_key.len() + U64_SIZE + U16_SIZE + value.len();
         if self.data.len() + total_len > self.block_size {
             return false;
         }
-        let key_overlap_len = key_overlap_len as u16;
 
         self.offsets.push(self.data.len() as u16);
+
+        let key_overlap_len = key_overlap_len as u16;
         self.data.extend_from_slice(&key_overlap_len.to_le_bytes());
-        self.add_data_u16(rest_key);
-        self.add_data_u16(value);
+        let rest_key_len = (rest_key.len() + U64_SIZE) as u16;
+        self.data.extend_from_slice(&rest_key_len.to_le_bytes());
+        self.data.extend_from_slice(rest_key);
+        self.data.extend_from_slice(&key.ts().to_le_bytes());
+
+        let value_len = value.len() as u16;
+        self.data.extend_from_slice(&value_len.to_le_bytes());
+        self.data.extend_from_slice(value);
 
         true
-    }
-
-    /// Add a variable length `data` into data.
-    /// This is a helper function for adding key and value with their length.
-    fn add_data_u16(&mut self, data: &[u8]) {
-        let data_len = data.len() as u16;
-        self.data.extend_from_slice(&data_len.to_le_bytes());
-        self.data.extend_from_slice(data);
     }
 }
 

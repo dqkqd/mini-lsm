@@ -13,8 +13,9 @@ use bytes::Buf;
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
-use crate::key::{KeyBytes, KeySlice};
+use crate::key::{KeyBytes, KeySlice, TS_MAX};
 use crate::lsm_storage::BlockCache;
+use crate::{U32_SIZE, U64_SIZE};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -31,7 +32,7 @@ impl BlockMeta {
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
     /// Each BlockMeta has the following layout:
-    /// | offset | first_key_len | first_key | last_key_len | last_key |
+    /// | offset | first_key_raw_len | first_key | first_key_timestamp | last_key_raw_len | last_key | last_key_timestamp |
     /// The whole block meta list has checksum at the end.
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
         let offset = buf.len();
@@ -39,10 +40,16 @@ impl BlockMeta {
         buf.extend_from_slice(&(block_meta.len() as u32).to_le_bytes());
         for block in block_meta {
             buf.extend_from_slice(&(block.offset as u32).to_le_bytes());
-            buf.extend_from_slice(&(block.first_key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(block.first_key.raw_ref());
-            buf.extend_from_slice(&(block.last_key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(block.last_key.raw_ref());
+
+            let first_key_len = block.first_key.raw_len() as u16;
+            buf.extend_from_slice(&first_key_len.to_le_bytes());
+            buf.extend_from_slice(block.first_key.key_ref());
+            buf.extend_from_slice(&block.first_key.ts().to_le_bytes());
+
+            let last_key_len = block.last_key.raw_len() as u16;
+            buf.extend_from_slice(&last_key_len.to_le_bytes());
+            buf.extend_from_slice(block.last_key.key_ref());
+            buf.extend_from_slice(&(block.last_key.ts()).to_le_bytes());
         }
 
         let data = &buf[offset..];
@@ -52,7 +59,7 @@ impl BlockMeta {
 
     /// Decode block meta from a buffer.
     /// Each BlockMeta has the following layout:
-    /// | offset | first_key_len | first_key | last_key_len | last_key |
+    /// | offset | first_key_raw_len | first_key | first_key_timestamp | last_key_raw_len | last_key | last_key_timestamp |
     pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
         let number_blocks = buf.get_u32_le() as usize;
 
@@ -61,15 +68,19 @@ impl BlockMeta {
                 let offset = buf.get_u32_le() as usize;
 
                 let first_key_len = buf.get_u16_le();
-                let first_key = buf.copy_to_bytes(first_key_len as usize);
+                let first_key = buf.copy_to_bytes(first_key_len as usize - U64_SIZE);
+                let ts = buf.get_u64_le();
+                let first_key = KeyBytes::from_bytes_with_ts(first_key, ts);
 
                 let last_key_len = buf.get_u16_le();
-                let last_key = buf.copy_to_bytes(last_key_len as usize);
+                let last_key = buf.copy_to_bytes(last_key_len as usize - U64_SIZE);
+                let ts = buf.get_u64_le();
+                let last_key = KeyBytes::from_bytes_with_ts(last_key, ts);
 
                 BlockMeta {
                     offset,
-                    first_key: KeyBytes::from_bytes(first_key),
-                    last_key: KeyBytes::from_bytes(last_key),
+                    first_key,
+                    last_key,
                 }
             })
             .collect()
@@ -157,29 +168,27 @@ impl SsTable {
     ///
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         // offsets
-        let offset = file.read(file.size() - 8, 8)?;
-        let block_meta_offset: [u8; 4] = offset[..4].try_into().unwrap();
-        let block_meta_offset = u32::from_le_bytes(block_meta_offset) as u64;
-        let bloom_filter_offset: [u8; 4] = offset[4..].try_into().unwrap();
-        let bloom_filter_offset = u32::from_le_bytes(bloom_filter_offset) as u64;
+        let offset = file.read(file.size() - U32_SIZE as u64 * 2, U32_SIZE as u64 * 2)?;
+
+        let block_meta_offset = u32::from_le_bytes(offset[..4].try_into()?) as u64;
+        let bloom_filter_offset = u32::from_le_bytes(offset[4..].try_into()?) as u64;
 
         // Calculate size based on offsets.
         let block_meta_size = bloom_filter_offset - block_meta_offset;
-        let bloom_filter_size = file.size() - 8 - bloom_filter_offset;
+        let bloom_filter_size = file.size() - U32_SIZE as u64 * 2 - bloom_filter_offset;
 
         // Read the whole block meta and bloom (instead of reading separately), to avoid disk seek.
-        let mut meta = file.read(block_meta_offset, block_meta_size + bloom_filter_size)?;
-        let bloom = meta.split_off(block_meta_size as usize);
-
-        // Checksum will be checked during bloom decoding.
-        let bloom = Bloom::decode(&bloom)?;
+        let meta = file.read(block_meta_offset, block_meta_size + bloom_filter_size)?;
+        let (block_meta, bloom) = meta.split_at(block_meta_size as usize);
 
         // Since we encode a list of block meta, we validate the checksum here.
-        let block_meta = validate_checksum(&meta)?;
+        let block_meta = validate_checksum(block_meta)?;
         let block_meta = BlockMeta::decode_block_meta(block_meta);
-
         let first_key = BlockMeta::first_key(&block_meta);
         let last_key = BlockMeta::last_key(&block_meta);
+
+        // Checksum will be checked during bloom decoding, don't need to validate separately.
+        let bloom = Bloom::decode(bloom)?;
 
         let sst = Self {
             file,
@@ -190,7 +199,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: u64::MAX,
+            max_ts: TS_MAX,
         };
 
         Ok(sst)
@@ -324,7 +333,7 @@ impl SsTable {
 /// Checksum is always a 32 bit integer append at the end of data.
 pub(crate) fn validate_checksum(data_and_checksum: &[u8]) -> Result<&[u8]> {
     let (data, expected_checksum) = data_and_checksum
-        .split_last_chunk::<4>()
+        .split_last_chunk::<U32_SIZE>()
         .with_context(|| "data do not contain checksum")?;
     let expected_checksum = u32::from_le_bytes(*expected_checksum);
     let checksum = crc32fast::hash(data);
