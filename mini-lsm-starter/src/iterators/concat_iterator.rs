@@ -61,8 +61,8 @@ impl SstConcatIterator {
 
     pub(crate) fn create_with_bound(
         sstables: Vec<Arc<SsTable>>,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
+        lower: Bound<KeySlice>,
+        upper: Bound<KeySlice>,
     ) -> Result<Self> {
         for (sst_idx, table) in sstables.iter().enumerate() {
             if let Ok(iter) = SsTableIterator::create_with_bound(table.clone(), lower, upper) {

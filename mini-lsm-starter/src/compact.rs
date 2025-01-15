@@ -19,7 +19,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, KeyVec};
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -114,7 +114,7 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn build_ssts<I>(&self, mut iter: I, compact_to_bottom: bool) -> Result<Vec<Arc<SsTable>>>
+    fn build_ssts<I>(&self, mut iter: I, _compact_to_bottom: bool) -> Result<Vec<Arc<SsTable>>>
     where
         I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
     {
@@ -128,23 +128,29 @@ impl LsmStorageInner {
         };
 
         let mut builder = SsTableBuilder::new(self.options.block_size);
+        let mut prev_key: Option<KeyVec> = None;
+
         while iter.is_valid() {
             let (key, value) = (iter.key(), iter.value());
-
-            // do not add deleted key if compacting to bottom
-            if compact_to_bottom {
-                if !value.is_empty() {
-                    builder.add(key, value);
-                }
-            } else {
-                builder.add(key, value);
-            }
+            builder.add(key, value);
 
             if builder.estimated_size() >= self.options.target_sst_size {
-                let oversized_builder =
-                    std::mem::replace(&mut builder, SsTableBuilder::new(self.options.block_size));
-                build(oversized_builder)?;
+                let same_as_prev_key = prev_key
+                    .as_ref()
+                    .map(|prev_key| prev_key.key_ref() == key.key_ref())
+                    .unwrap_or(false);
+
+                // do not split builder if this key is the same as previous key.
+                if !same_as_prev_key {
+                    let oversized_builder = std::mem::replace(
+                        &mut builder,
+                        SsTableBuilder::new(self.options.block_size),
+                    );
+                    build(oversized_builder)?;
+                }
             }
+
+            prev_key.replace(key.to_key_vec());
 
             if iter.next().is_err() {
                 break;

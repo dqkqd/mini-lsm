@@ -1,13 +1,13 @@
 use std::ops::Bound;
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
 
 use crate::{
     iterators::{
         concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator, StorageIterator,
     },
+    key::{KeyBytes, KeySlice},
     mem_table::{map_bound, MemTableIterator},
     table::SsTableIterator,
 };
@@ -22,25 +22,27 @@ type LsmIteratorInner = TwoMergeIterator<
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
-    lower: Bound<Bytes>,
-    upper: Bound<Bytes>,
+    lower: Bound<KeyBytes>,
+    upper: Bound<KeyBytes>,
+    prev_key: Option<KeyBytes>,
     finished: bool,
 }
 
 impl LsmIterator {
     pub(crate) fn new(
         iter: LsmIteratorInner,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
+        lower: Bound<KeySlice>,
+        upper: Bound<KeySlice>,
     ) -> Result<Self> {
         let mut iter = Self {
             inner: iter,
             lower: map_bound(lower),
             upper: map_bound(upper),
+            prev_key: None,
             finished: false,
         };
-        iter.skip_deleted_keys()?;
         iter.skip_lower_keys()?;
+        iter.skip_deleted_keys()?;
         iter.check_finished();
 
         Ok(iter)
@@ -48,8 +50,8 @@ impl LsmIterator {
 
     fn skip_deleted_keys(&mut self) -> Result<()> {
         while self.is_valid() && self.value().is_empty() {
-            // Do not call `self.next` because it will recursively call this.
-            self.inner.next()?;
+            // TODO: is this correct?
+            self.next()?;
         }
         Ok(())
     }
@@ -57,9 +59,18 @@ impl LsmIterator {
     fn skip_lower_keys(&mut self) -> Result<()> {
         while self.is_valid() {
             match &self.lower {
-                Bound::Included(key) if self.key() < key => self.inner.next()?,
-                Bound::Excluded(key) if self.key() <= key => self.inner.next()?,
+                Bound::Included(key) if self.key() < key.key_ref() => self.inner.next()?,
+                Bound::Excluded(key) if self.key() <= key.key_ref() => self.inner.next()?,
                 _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_equal_keys(&mut self) -> Result<()> {
+        if let Some(prev_key) = self.prev_key.as_ref() {
+            while self.is_valid() && prev_key.key_ref() == self.key() {
+                self.inner.next()?;
             }
         }
         Ok(())
@@ -70,8 +81,8 @@ impl LsmIterator {
             self.finished = true;
         } else {
             self.finished = match &self.upper {
-                Bound::Included(key) if self.key() > key => true,
-                Bound::Excluded(key) if self.key() >= key => true,
+                Bound::Included(key) if self.key() > key.key_ref() => true,
+                Bound::Excluded(key) if self.key() >= key.key_ref() => true,
                 _ => false,
             };
         }
@@ -95,9 +106,14 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        if self.is_valid() {
+            self.prev_key
+                .replace(self.inner.key().to_key_vec().into_key_bytes());
+        }
         self.inner.next()?;
-        self.skip_deleted_keys()?;
         self.skip_lower_keys()?;
+        self.skip_equal_keys()?;
+        self.skip_deleted_keys()?;
         self.check_finished();
         Ok(())
     }
