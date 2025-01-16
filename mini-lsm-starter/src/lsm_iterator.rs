@@ -50,8 +50,12 @@ impl LsmIterator {
 
     fn skip_deleted_keys(&mut self) -> Result<()> {
         while self.is_valid() && self.value().is_empty() {
-            // TODO: is this correct?
-            self.next()?;
+            // skip this key and all keys equal this.
+            let key = self.key().to_vec();
+
+            while self.is_valid() && self.key() == key {
+                self.inner.next()?;
+            }
         }
         Ok(())
     }
