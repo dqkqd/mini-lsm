@@ -7,7 +7,7 @@ use crate::{
         concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator, StorageIterator,
     },
-    key::{KeyBytes, KeySlice},
+    key::{KeyBytes, KeySlice, KeyVec},
     mem_table::{map_bound, MemTableIterator},
     table::SsTableIterator,
 };
@@ -19,6 +19,13 @@ type LsmIteratorInner = TwoMergeIterator<
     // L1 sst
     MergeIterator<SstConcatIterator>,
 >;
+
+enum KeyStatus {
+    Invalid,
+    Deleted(KeyVec),
+    EqualPrevious(KeyBytes),
+    Valid,
+}
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
@@ -42,21 +49,45 @@ impl LsmIterator {
             finished: false,
         };
         iter.skip_lower_keys()?;
-        iter.skip_deleted_keys()?;
-        iter.check_finished();
+        iter.skip_bad_keys()?;
 
         Ok(iter)
     }
 
-    fn skip_deleted_keys(&mut self) -> Result<()> {
-        while self.is_valid() && self.value().is_empty() {
-            // skip this key and all keys equal this.
-            let key = self.key().to_vec();
+    fn key_status(&self) -> KeyStatus {
+        if !self.is_valid() {
+            KeyStatus::Invalid
+        } else if self.value().is_empty() {
+            KeyStatus::Deleted(self.inner.key().to_key_vec())
+        } else if self
+            .prev_key
+            .as_ref()
+            .is_some_and(|prev_key| prev_key.key_ref() == self.key())
+        {
+            KeyStatus::EqualPrevious(self.prev_key.as_ref().unwrap().clone())
+        } else {
+            KeyStatus::Valid
+        }
+    }
 
-            while self.is_valid() && self.key() == key {
-                self.inner.next()?;
+    fn skip_bad_keys(&mut self) -> Result<()> {
+        loop {
+            match self.key_status() {
+                KeyStatus::Deleted(key) => {
+                    while self.is_valid() && self.key() == key.key_ref() {
+                        self.inner.next()?;
+                    }
+                }
+                KeyStatus::EqualPrevious(key) => {
+                    while self.is_valid() && self.key() == key.key_ref() {
+                        self.inner.next()?;
+                    }
+                }
+                KeyStatus::Invalid => break,
+                KeyStatus::Valid => break,
             }
         }
+        self.check_finished();
         Ok(())
     }
 
@@ -66,15 +97,6 @@ impl LsmIterator {
                 Bound::Included(key) if self.key() < key.key_ref() => self.inner.next()?,
                 Bound::Excluded(key) if self.key() <= key.key_ref() => self.inner.next()?,
                 _ => break,
-            }
-        }
-        Ok(())
-    }
-
-    fn skip_equal_keys(&mut self) -> Result<()> {
-        if let Some(prev_key) = self.prev_key.as_ref() {
-            while self.is_valid() && prev_key.key_ref() == self.key() {
-                self.inner.next()?;
             }
         }
         Ok(())
@@ -115,9 +137,7 @@ impl StorageIterator for LsmIterator {
                 .replace(self.inner.key().to_key_vec().into_key_bytes());
         }
         self.inner.next()?;
-        self.skip_equal_keys()?;
-        self.skip_deleted_keys()?;
-        self.check_finished();
+        self.skip_bad_keys()?;
         Ok(())
     }
 
