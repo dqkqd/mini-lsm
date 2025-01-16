@@ -115,7 +115,6 @@ impl StorageIterator for LsmIterator {
                 .replace(self.inner.key().to_key_vec().into_key_bytes());
         }
         self.inner.next()?;
-        self.skip_lower_keys()?;
         self.skip_equal_keys()?;
         self.skip_deleted_keys()?;
         self.check_finished();
