@@ -263,6 +263,10 @@ impl LsmStorageInner {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn mvcc(&self) -> &LsmMvccInner {
+        self.mvcc.as_ref().unwrap()
+    }
+
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
@@ -557,14 +561,12 @@ impl LsmStorageInner {
     }
 
     pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
-        let mvcc = self.mvcc.as_ref().with_context(|| "mvcc is not enabled")?;
-        let txn = mvcc.new_txn(self.clone(), self.options.serializable);
+        let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
         Ok(txn)
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
-        let mvcc = self.mvcc.as_ref().with_context(|| "mvcc is not enabled")?;
-        let txn = mvcc.new_txn(self.clone(), self.options.serializable);
+        let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
         txn.scan(lower, upper)
     }
 
