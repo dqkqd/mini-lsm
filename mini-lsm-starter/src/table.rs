@@ -13,7 +13,7 @@ use bytes::Buf;
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
-use crate::key::{KeyBytes, KeySlice, TS_MAX};
+use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 use crate::{U32_SIZE, U64_SIZE};
 
@@ -164,18 +164,24 @@ impl SsTable {
     /// A SSTable has the following layout:
     ///
     /// | data block | data block checksum | data block | data block checksum | .... | meta block | meta block checksum
-    /// | bloom filter | bloom filter checksum | meta block offset | bloom filter offset |
+    /// | bloom filter | bloom filter checksum | meta block offset | bloom filter offset | sst max timestamp |
     ///
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        // offsets
-        let offset = file.read(file.size() - U32_SIZE as u64 * 2, U32_SIZE as u64 * 2)?;
+        // max timestamp
+        let offset_and_timestamp_len = (U32_SIZE * 2 + U64_SIZE) as u64;
+        let offset_and_timestamp = file.read(
+            file.size() - offset_and_timestamp_len,
+            offset_and_timestamp_len,
+        )?;
 
-        let block_meta_offset = u32::from_le_bytes(offset[..4].try_into()?) as u64;
-        let bloom_filter_offset = u32::from_le_bytes(offset[4..].try_into()?) as u64;
+        let (offset, max_sst_timestamp) = offset_and_timestamp.split_at(U32_SIZE * 2);
+        let block_meta_offset = u32::from_le_bytes(offset[..U32_SIZE].try_into()?) as u64;
+        let bloom_filter_offset = u32::from_le_bytes(offset[U32_SIZE..].try_into()?) as u64;
+        let max_sst_timestamp = u64::from_le_bytes(max_sst_timestamp.try_into()?);
 
         // Calculate size based on offsets.
         let block_meta_size = bloom_filter_offset - block_meta_offset;
-        let bloom_filter_size = file.size() - U32_SIZE as u64 * 2 - bloom_filter_offset;
+        let bloom_filter_size = file.size() - offset_and_timestamp_len - bloom_filter_offset;
 
         // Read the whole block meta and bloom (instead of reading separately), to avoid disk seek.
         let meta = file.read(block_meta_offset, block_meta_size + bloom_filter_size)?;
@@ -199,7 +205,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: TS_MAX,
+            max_ts: max_sst_timestamp,
         };
 
         Ok(sst)

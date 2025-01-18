@@ -20,10 +20,11 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::key::{KeySlice, TS_MIN, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
+use crate::mvcc::txn::{Transaction, TxnIterator};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
@@ -207,7 +208,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -235,11 +236,7 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -287,9 +284,6 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
-        // TODO: recover ts?
-        let mvcc = LsmMvccInner::new(TS_DEFAULT);
-
         let mut storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
@@ -299,13 +293,31 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: None,
             options: options.into(),
-            mvcc: Some(mvcc),
+            mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
         let (state, manifest) = storage.recover()?;
+
+        let mut max_ts = TS_MIN;
+        for memtable in state.ordered_memtables() {
+            let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+            while iter.is_valid() {
+                let key = iter.key();
+                max_ts = max_ts.max(key.ts());
+                iter.next()?;
+            }
+        }
+        if max_ts == TS_MIN {
+            for table in state.sstables.values() {
+                max_ts = max_ts.max(table.max_ts())
+            }
+        }
+        let mvcc = LsmMvccInner::new(max_ts);
+
         storage.state = Arc::new(RwLock::new(Arc::new(state)));
         storage.manifest = Some(manifest);
+        storage.mvcc = Some(mvcc);
 
         Ok(storage)
     }
@@ -324,15 +336,21 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
+    pub fn get(self: &Arc<Self>, key: &[u8]) -> Result<Option<Bytes>> {
+        let mvcc = self.mvcc.as_ref().with_context(|| "mvcc is not enabled")?;
+        let txn = mvcc.new_txn(self.clone(), self.options.serializable);
+        txn.get(key)
+    }
+
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get_with_ts(&self, key: &[u8], ts: u64) -> Result<Option<Bytes>> {
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
 
         let keyhash = farmhash::fingerprint32(key);
-        let lower = Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN));
+        let lower = Bound::Included(KeySlice::from_slice(key, ts));
         let upper = Bound::Included(KeySlice::from_slice(key, TS_RANGE_END));
 
         let memtable_iters: Vec<Box<MemTableIterator>> = snapshot
@@ -383,10 +401,11 @@ impl LsmStorageInner {
         let leveled_iters = MergeIterator::create(leveled_iters);
 
         let iters = TwoMergeIterator::create(memtable_and_l0_iters, leveled_iters)?;
+        let lsm_iterator = LsmIterator::new(iters, lower, upper, ts)?;
 
         let mut value = None;
-        if iters.is_valid() && iters.key().key_ref() == key {
-            value = Some(Bytes::copy_from_slice(iters.value()))
+        if lsm_iterator.is_valid() && lsm_iterator.key() == key {
+            value = Some(Bytes::copy_from_slice(lsm_iterator.value()))
         }
         // Filter out tombstone value.
         value = value.filter(|value| !value.is_empty());
@@ -537,16 +556,24 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
+        let mvcc = self.mvcc.as_ref().with_context(|| "mvcc is not enabled")?;
+        let txn = mvcc.new_txn(self.clone(), self.options.serializable);
+        Ok(txn)
+    }
+
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        let mvcc = self.mvcc.as_ref().with_context(|| "mvcc is not enabled")?;
+        let txn = mvcc.new_txn(self.clone(), self.options.serializable);
+        txn.scan(lower, upper)
     }
 
     /// Create an iterator over a range of keys.
-    pub fn scan(
+    pub fn scan_with_ts(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
+        ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
         let snapshot = {
             let guard = self.state.read();
@@ -554,13 +581,13 @@ impl LsmStorageInner {
         };
 
         let lower = match lower {
-            Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, TS_RANGE_BEGIN)),
-            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, TS_RANGE_END)),
+            Bound::Included(key) => Bound::Included(KeySlice::from_slice(key, ts)),
+            Bound::Excluded(key) => Bound::Excluded(KeySlice::from_slice(key, TS_RANGE_END)),
             Bound::Unbounded => Bound::Unbounded,
         };
         let upper = match upper {
-            Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, TS_RANGE_END)),
-            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, TS_RANGE_BEGIN)),
+            Bound::Included(key) => Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+            Bound::Excluded(key) => Bound::Excluded(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
             Bound::Unbounded => Bound::Unbounded,
         };
 
@@ -598,7 +625,7 @@ impl LsmStorageInner {
         let leveled_iters = MergeIterator::create(leveled_iters);
 
         let iters = TwoMergeIterator::create(memtable_and_l0_iters, leveled_iters)?;
-        let lsm_iterator = LsmIterator::new(iters, lower, upper)?;
+        let lsm_iterator = LsmIterator::new(iters, lower, upper, ts)?;
         let fused_iterator = FusedIterator::new(lsm_iterator);
 
         Ok(fused_iterator)

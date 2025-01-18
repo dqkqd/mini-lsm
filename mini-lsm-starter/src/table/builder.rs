@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use super::{BlockMeta, SsTable};
 use crate::{
     block::BlockBuilder,
-    key::KeySlice,
+    key::{KeySlice, TS_MIN},
     lsm_storage::BlockCache,
     table::{bloom::Bloom, FileObject},
 };
@@ -18,6 +18,7 @@ pub struct SsTableBuilder {
     key_hashes: Vec<u32>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    max_ts: u64,
 }
 
 impl SsTableBuilder {
@@ -30,6 +31,7 @@ impl SsTableBuilder {
             key_hashes: Vec::new(),
             meta: Vec::new(),
             block_size,
+            max_ts: TS_MIN,
         }
     }
 
@@ -40,6 +42,7 @@ impl SsTableBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         // Can add key, just return
         if self.builder.add(key, value) {
+            self.max_ts = self.max_ts.max(key.ts());
             return;
         }
 
@@ -51,6 +54,7 @@ impl SsTableBuilder {
             if !self.builder.add(key, value) {
                 panic!("cannot add new key after splitting builder");
             }
+            self.max_ts = self.max_ts.max(key.ts());
         }
     }
 
@@ -119,7 +123,7 @@ impl SsTableBuilder {
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
     ///
     /// The layout is saved like this:
-    /// | data block | data block | .... | meta block | bloom filter | meta block offset | bloom filter offset |
+    /// | data block | data block | .... | meta block | bloom filter | meta block offset | bloom filter offset | sst max timestamp |
     ///
     pub fn build(
         mut self,
@@ -163,6 +167,9 @@ impl SsTableBuilder {
         // bloom filter offset
         data.extend_from_slice(&(bloom_filter_offset as u32).to_le_bytes());
 
+        // max timestamp
+        data.extend_from_slice(&self.max_ts.to_le_bytes());
+
         // save to file
         let file = FileObject::create(path.as_ref(), data)?;
 
@@ -175,7 +182,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: u64::MAX,
+            max_ts: self.max_ts,
         };
 
         Ok(sst)

@@ -25,6 +25,7 @@ enum KeyStatus {
     Deleted(KeyVec),
     EqualPrevious(KeyBytes),
     Valid,
+    OutOfTimestampBound,
 }
 
 pub struct LsmIterator {
@@ -33,6 +34,7 @@ pub struct LsmIterator {
     upper: Bound<KeyBytes>,
     prev_key: Option<KeyBytes>,
     finished: bool,
+    read_ts: u64,
 }
 
 impl LsmIterator {
@@ -40,6 +42,7 @@ impl LsmIterator {
         iter: LsmIteratorInner,
         lower: Bound<KeySlice>,
         upper: Bound<KeySlice>,
+        read_ts: u64,
     ) -> Result<Self> {
         let mut iter = Self {
             inner: iter,
@@ -47,6 +50,7 @@ impl LsmIterator {
             upper: map_bound(upper),
             prev_key: None,
             finished: false,
+            read_ts,
         };
         iter.skip_lower_keys()?;
         iter.skip_bad_keys()?;
@@ -57,6 +61,8 @@ impl LsmIterator {
     fn key_status(&self) -> KeyStatus {
         if !self.is_valid() {
             KeyStatus::Invalid
+        } else if self.inner.key().ts() > self.read_ts {
+            KeyStatus::OutOfTimestampBound
         } else if self.value().is_empty() {
             KeyStatus::Deleted(self.inner.key().to_key_vec())
         } else if self
@@ -82,6 +88,9 @@ impl LsmIterator {
                     while self.is_valid() && self.key() == key.key_ref() {
                         self.inner.next()?;
                     }
+                }
+                KeyStatus::OutOfTimestampBound => {
+                    self.inner.next()?;
                 }
                 KeyStatus::Invalid => break,
                 KeyStatus::Valid => break,
