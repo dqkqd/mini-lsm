@@ -20,7 +20,7 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::{KeySlice, KeyVec};
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -114,7 +114,13 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn build_ssts<I>(&self, mut iter: I, compact_to_bottom: bool) -> Result<Vec<Arc<SsTable>>>
+    fn build_ssts<I>(
+        &self,
+        mut iter: I,
+        watermark: u64,
+        compaction_filters: Vec<CompactionFilter>,
+        compact_to_bottom: bool,
+    ) -> Result<Vec<Arc<SsTable>>>
     where
         I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
     {
@@ -126,11 +132,16 @@ impl LsmStorageInner {
             new_sstables.push(Arc::new(table));
             Ok(())
         };
+        let should_filter = |key: KeySlice| -> bool {
+            compaction_filters
+                .iter()
+                .any(|compaction_fitler| match compaction_fitler {
+                    CompactionFilter::Prefix(bytes) => key.key_ref().starts_with(bytes),
+                })
+        };
 
         let mut builder = SsTableBuilder::new(self.options.block_size);
         let mut prev_key: Option<KeyVec> = None;
-
-        let watermark = self.mvcc().watermark();
 
         while iter.is_valid() {
             let (key, value) = (iter.key(), iter.value());
@@ -143,7 +154,10 @@ impl LsmStorageInner {
                 });
                 // Only add keys that are not equal the previous checked key.
                 // Also remove keys that are empty.
-                if !same_prev_key_is_added && (!value.is_empty() || !compact_to_bottom) {
+                if !same_prev_key_is_added
+                    && (!value.is_empty() || !compact_to_bottom)
+                    && !should_filter(key)
+                {
                     builder.add(key, value);
                 }
             }
@@ -179,6 +193,9 @@ impl LsmStorageInner {
     }
 
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        let watermark = self.mvcc().watermark();
+        let compaction_filters = self.compaction_filters.lock().clone();
+
         match task {
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
@@ -204,7 +221,12 @@ impl LsmStorageInner {
                 let l1_iter = SstConcatIterator::create_and_seek_to_first(l1_sstables)?;
 
                 let iter = TwoMergeIterator::create(l0_iters, l1_iter)?;
-                self.build_ssts(iter, task.compact_to_bottom_level())
+                self.build_ssts(
+                    iter,
+                    watermark,
+                    compaction_filters,
+                    task.compact_to_bottom_level(),
+                )
             }
             CompactionTask::Simple(simple_leveled_compaction_task) => {
                 match simple_leveled_compaction_task.upper_level {
@@ -234,7 +256,12 @@ impl LsmStorageInner {
                         let l1_iters = SstConcatIterator::create_and_seek_to_first(l1_sstables)?;
 
                         let iter = TwoMergeIterator::create(l0_iters, l1_iters)?;
-                        self.build_ssts(iter, task.compact_to_bottom_level())
+                        self.build_ssts(
+                            iter,
+                            watermark,
+                            compaction_filters,
+                            task.compact_to_bottom_level(),
+                        )
                     }
                     Some(_) => {
                         let sstables = {
@@ -259,7 +286,12 @@ impl LsmStorageInner {
                             SstConcatIterator::create_and_seek_to_first(lower_sstables)?;
 
                         let iter = TwoMergeIterator::create(upper_iters, lower_iters)?;
-                        self.build_ssts(iter, task.compact_to_bottom_level())
+                        self.build_ssts(
+                            iter,
+                            watermark,
+                            compaction_filters,
+                            task.compact_to_bottom_level(),
+                        )
                     }
                 }
             }
@@ -283,7 +315,12 @@ impl LsmStorageInner {
                     .collect();
 
                 let iter = MergeIterator::create(iters);
-                self.build_ssts(iter, task.compact_to_bottom_level())
+                self.build_ssts(
+                    iter,
+                    watermark,
+                    compaction_filters,
+                    task.compact_to_bottom_level(),
+                )
             }
             CompactionTask::Leveled(leveled_compaction_task) => {
                 match leveled_compaction_task.upper_level {
@@ -313,7 +350,12 @@ impl LsmStorageInner {
                         let l1_iters = SstConcatIterator::create_and_seek_to_first(l1_sstables)?;
 
                         let iter = TwoMergeIterator::create(l0_iters, l1_iters)?;
-                        self.build_ssts(iter, task.compact_to_bottom_level())
+                        self.build_ssts(
+                            iter,
+                            watermark,
+                            compaction_filters,
+                            task.compact_to_bottom_level(),
+                        )
                     }
                     Some(_) => {
                         let sstables = {
@@ -338,7 +380,12 @@ impl LsmStorageInner {
                             SstConcatIterator::create_and_seek_to_first(lower_sstables)?;
 
                         let iter = TwoMergeIterator::create(upper_iters, lower_iters)?;
-                        self.build_ssts(iter, task.compact_to_bottom_level())
+                        self.build_ssts(
+                            iter,
+                            watermark,
+                            compaction_filters,
+                            task.compact_to_bottom_level(),
+                        )
                     }
                 }
             }
