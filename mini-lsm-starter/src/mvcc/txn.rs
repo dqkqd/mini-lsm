@@ -1,13 +1,10 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::{
     collections::HashSet,
     ops::Bound,
     sync::{atomic::AtomicBool, Arc},
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -18,6 +15,8 @@ use crate::{
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::{LsmStorageInner, WriteBatchRecord},
 };
+
+use super::CommittedTxnData;
 
 // TODO: move this out
 fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
@@ -42,6 +41,8 @@ impl Transaction {
         if self.committed() {
             panic!("getting from comitted transaction");
         }
+
+        self.record_read(key);
 
         if let Some(entry) = self.local_storage.get(key) {
             if entry.value().is_empty() {
@@ -84,6 +85,8 @@ impl Transaction {
 
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+
+        self.record_write(key);
     }
 
     pub fn delete(&self, key: &[u8]) {
@@ -99,19 +102,60 @@ impl Transaction {
             panic!("comitting from comitted transaction");
         }
 
-        let batch: Vec<WriteBatchRecord<Bytes>> = self
-            .local_storage
-            .iter()
-            .map(|entry| {
-                if entry.value().is_empty() {
-                    WriteBatchRecord::Del(entry.key().clone())
-                } else {
-                    WriteBatchRecord::Put(entry.key().clone(), entry.value().clone())
-                }
-            })
-            .collect();
+        if !self.local_storage.is_empty() {
+            let batch: Vec<WriteBatchRecord<Bytes>> = self
+                .local_storage
+                .iter()
+                .map(|entry| {
+                    if entry.value().is_empty() {
+                        WriteBatchRecord::Del(entry.key().clone())
+                    } else {
+                        WriteBatchRecord::Put(entry.key().clone(), entry.value().clone())
+                    }
+                })
+                .collect();
 
-        self.inner.write_batch(&batch)?;
+            let mvcc = self.inner.mvcc();
+            let expected_commit_ts = mvcc.latest_commit_ts() + 1;
+
+            let (read_set, write_set) = match &self.key_hashes {
+                Some(key_hashes) => {
+                    let key_hashes = key_hashes.lock();
+                    (key_hashes.0.clone(), key_hashes.1.clone())
+                }
+                None => (HashSet::new(), HashSet::new()),
+            };
+            let watermark = mvcc.watermark();
+
+            {
+                let _commit_lock = mvcc.commit_lock.lock();
+
+                let mut committed_txns = mvcc.committed_txns.lock();
+                // gc old committed ts transaction
+                committed_txns.retain(|&k, _| k >= watermark);
+
+                // no need to verify if this transaction has no write
+                if !write_set.is_empty() {
+                    let valid_transaction = committed_txns
+                        .range(self.read_ts + 1..expected_commit_ts)
+                        .all(|(_, committed_txn_data)| {
+                            committed_txn_data.key_hashes.is_disjoint(&read_set)
+                        });
+                    if !valid_transaction {
+                        bail!("invalid transaction");
+                    }
+                }
+
+                let commit_ts = self.inner.write_batch_inner(&batch)?;
+
+                let committed_txn_data = CommittedTxnData {
+                    key_hashes: write_set,
+                    read_ts: self.read_ts,
+                    commit_ts,
+                };
+                committed_txns.insert(commit_ts, committed_txn_data);
+            }
+        }
 
         self.committed
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -121,6 +165,20 @@ impl Transaction {
 
     fn committed(&self) -> bool {
         self.committed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_read<T: AsRef<[u8]>>(&self, key: T) {
+        if let Some(key_hashes) = &self.key_hashes {
+            let mut key_hashes = key_hashes.lock();
+            key_hashes.0.insert(farmhash::hash32(key.as_ref()));
+        }
+    }
+
+    fn record_write<T: AsRef<[u8]>>(&self, key: T) {
+        if let Some(key_hashes) = &self.key_hashes {
+            let mut key_hashes = key_hashes.lock();
+            key_hashes.1.insert(farmhash::hash32(key.as_ref()));
+        }
     }
 }
 
@@ -178,7 +236,7 @@ impl StorageIterator for TxnLocalIterator {
 }
 
 pub struct TxnIterator {
-    _txn: Arc<Transaction>,
+    txn: Arc<Transaction>,
     iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
 }
 
@@ -187,11 +245,12 @@ impl TxnIterator {
         txn: Arc<Transaction>,
         iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
-        Ok(Self { _txn: txn, iter })
+        Ok(Self { txn, iter })
     }
 
     fn skip_deleted_keys(&mut self) -> Result<()> {
         while self.is_valid() && self.value().is_empty() {
+            self.txn.record_read(self.iter.key());
             self.iter.next()?;
         }
         Ok(())
@@ -217,6 +276,7 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        self.txn.record_read(self.iter.key());
         self.iter.next()?;
         self.skip_deleted_keys()?;
         Ok(())
