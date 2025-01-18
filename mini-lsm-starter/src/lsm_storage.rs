@@ -440,10 +440,7 @@ impl LsmStorageInner {
                     }
                 })
                 .collect();
-            for (key, value) in data {
-                state.memtable.put(key, value)?;
-            }
-            // state.memtable.put_batch(&data)?;
+            state.memtable.put_batch(&data)?;
             state.memtable.approximate_size() >= self.options.target_sst_size
         };
 

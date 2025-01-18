@@ -5,15 +5,14 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use bytes::Bytes;
+use anyhow::Result;
+use bytes::{Buf, Bytes};
 use crossbeam_skiplist::SkipMap;
-use nom::AsBytes;
 use parking_lot::Mutex;
 
 use crate::key::{KeyBytes, KeySlice};
 use crate::table::validate_checksum;
-use crate::{U16_SIZE, U32_SIZE, U64_SIZE};
+use crate::{U16_SIZE, U32_SIZE};
 
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
@@ -28,36 +27,17 @@ impl Wal {
     }
 
     /// Recover WAL from a given path
-    /// Each record in the WAL has the following layout:
-    /// | key_raw_len | key | timestamp | value_len | value | checksum |
+    /// All records in the WAL file is stored as batch with the following layout:
+    /// | HEADER     |                 BODY                                    | FOOTER  |
+    /// | batch size | key_len | key | timestamp | value_len | value | ... | checksum|
     pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
 
         let mut reader = BufReader::new(&file);
-        let mut buf_checksum = [0_u8; U32_SIZE];
-
-        while let (Ok(mut key_data), Ok(mut value_data), Ok(_)) = (
-            read_data_u16_with_length(&mut reader),
-            read_data_u16_with_length(&mut reader),
-            reader.read_exact(&mut buf_checksum),
-        ) {
-            let data_and_checksum = [key_data.as_bytes(), &value_data, &buf_checksum].concat();
-            if validate_checksum(&data_and_checksum).is_err() {
-                continue;
+        loop {
+            if Self::recover_one_batch(&mut reader, skiplist).is_err() {
+                break;
             }
-
-            // Remove the length data.
-            key_data.drain(..2);
-            value_data.drain(..2);
-
-            let (key, ts) = key_data
-                .split_last_chunk::<U64_SIZE>()
-                .with_context(|| "key should contain timestamp")?;
-            let ts = u64::from_le_bytes(*ts);
-
-            let key = KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key), ts);
-            let value = Bytes::from(value_data);
-            skiplist.insert(key, value);
         }
 
         Ok(Self {
@@ -65,33 +45,68 @@ impl Wal {
         })
     }
 
+    /// One batch has the following layout:
+    /// | HEADER     |                 BODY                                    | FOOTER  |
+    /// | batch size | key_len | key | timestamp | value_len | value | ... | checksum|
+    fn recover_one_batch<R: Read>(
+        reader: &mut R,
+        skiplist: &SkipMap<KeyBytes, Bytes>,
+    ) -> Result<()> {
+        let mut batch_size = [0; U32_SIZE];
+        reader.read_exact(&mut batch_size)?;
+        let batch_size = u32::from_le_bytes(batch_size);
+
+        let mut body_and_checksum = vec![0; batch_size as usize + U32_SIZE];
+        reader.read_exact(&mut body_and_checksum)?;
+        let mut body = validate_checksum(&body_and_checksum)?;
+
+        while body.has_remaining() {
+            let key_len = body.get_u16_le();
+            let key = body.copy_to_bytes(key_len as usize);
+            let ts = body.get_u64_le();
+
+            let value_len = body.get_u16_le();
+            let value = body.copy_to_bytes(value_len as usize);
+
+            let key = KeyBytes::from_bytes_with_ts(key, ts);
+            skiplist.insert(key, value);
+        }
+
+        Ok(())
+    }
+
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
         self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5.
-    /// Each record in the WAL has the following layout:
-    /// | key_raw_len | key | timestamp | value_len | value | checksum |
+    /// The whole batch has this layout:
+    /// | HEADER     |                 BODY                                    | FOOTER  |
+    /// | batch size | key_len | key | timestamp | value_len | value | ... | checksum|
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        let mut buf = self.file.lock();
-        for (key, value) in data {
-            let mut keyvalue_data: Vec<u8> =
-                Vec::with_capacity(key.raw_len() + value.len() + U16_SIZE * 2 + U32_SIZE);
+        let mut body = Vec::new();
 
-            let key_raw_len = key.raw_len() as u16;
-            keyvalue_data.extend_from_slice(&key_raw_len.to_le_bytes());
-            keyvalue_data.extend_from_slice(key.key_ref());
-            keyvalue_data.extend_from_slice(&key.ts().to_le_bytes());
+        for (key, value) in data {
+            let key_len = key.key_len() as u16;
+            body.extend_from_slice(&key_len.to_le_bytes());
+            body.extend_from_slice(key.key_ref());
+            body.extend_from_slice(&key.ts().to_le_bytes());
 
             let value_len = value.len() as u16;
-            keyvalue_data.extend_from_slice(&value_len.to_le_bytes());
-            keyvalue_data.extend_from_slice(value);
-
-            let checksum = crc32fast::hash(&keyvalue_data);
-            keyvalue_data.extend_from_slice(&checksum.to_le_bytes());
-
-            buf.write_all(&keyvalue_data)?;
+            body.extend_from_slice(&value_len.to_le_bytes());
+            body.extend_from_slice(value);
         }
+
+        let mut buf = self.file.lock();
+
+        let batch_size = body.len() as u32;
+        buf.write_all(&batch_size.to_le_bytes())?;
+
+        buf.write_all(&body)?;
+
+        let checksum = crc32fast::hash(&body);
+        buf.write_all(&checksum.to_le_bytes())?;
+
         Ok(())
     }
 

@@ -114,44 +114,27 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
+        self.put_batch(&[(key, value)])
+    }
+
+    /// Implement this in week 3, day 5.
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         if let Some(wal) = &self.wal {
-            wal.put(key, value)?;
+            wal.put_batch(data)?;
         }
 
-        let key = key.to_key_vec().into_key_bytes();
-        let value = Bytes::copy_from_slice(value);
-        let size = key.raw_len() + value.len();
+        let mut size = 0;
+        for (key, value) in data {
+            let key = key.to_key_vec().into_key_bytes();
+            let value = Bytes::copy_from_slice(value);
+            size += key.raw_len() + value.len();
+            self.map.insert(key, value);
+        }
 
-        self.map.insert(key, value);
         self.approximate_size
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
-    }
-
-    /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        todo!()
-        // if let Some(wal) = &self.wal {
-        //     let data: Vec<(&[u8], &[u8])> = data
-        //         .iter()
-        //         .map(|&(key, value)| (key.raw_ref(), value))
-        //         .collect();
-        //     wal.put_batch(&data)?;
-        // }
-        //
-        // let mut size = 0;
-        // for (key, value) in data {
-        //     let key = Bytes::copy_from_slice(key.raw_ref());
-        //     let value = Bytes::copy_from_slice(value);
-        //     size += key.len() + value.len();
-        //     self.map.insert(key, value);
-        // }
-        //
-        // self.approximate_size
-        //     .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-        //
-        // Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {
