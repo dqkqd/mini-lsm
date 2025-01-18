@@ -114,7 +114,7 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn build_ssts<I>(&self, mut iter: I, _compact_to_bottom: bool) -> Result<Vec<Arc<SsTable>>>
+    fn build_ssts<I>(&self, mut iter: I, compact_to_bottom: bool) -> Result<Vec<Arc<SsTable>>>
     where
         I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
     {
@@ -130,15 +130,28 @@ impl LsmStorageInner {
         let mut builder = SsTableBuilder::new(self.options.block_size);
         let mut prev_key: Option<KeyVec> = None;
 
+        let watermark = self.mvcc().watermark();
+
         while iter.is_valid() {
             let (key, value) = (iter.key(), iter.value());
-            builder.add(key, value);
+            if key.ts() > watermark {
+                // Always keep keys that above watermark.
+                builder.add(key, value);
+            } else {
+                let same_prev_key_is_added = prev_key.as_ref().is_some_and(|prev_key| {
+                    prev_key.key_ref() == key.key_ref() && prev_key.ts() <= watermark
+                });
+                // Only add keys that are not equal the previous checked key.
+                // Also remove keys that are empty.
+                if !same_prev_key_is_added && (!value.is_empty() || !compact_to_bottom) {
+                    builder.add(key, value);
+                }
+            }
 
             if builder.estimated_size() >= self.options.target_sst_size {
                 let same_as_prev_key = prev_key
                     .as_ref()
-                    .map(|prev_key| prev_key.key_ref() == key.key_ref())
-                    .unwrap_or(false);
+                    .is_some_and(|prev_key| prev_key.key_ref() == key.key_ref());
 
                 // do not split builder if this key is the same as previous key.
                 if !same_as_prev_key {
